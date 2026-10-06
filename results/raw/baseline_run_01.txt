@@ -1,0 +1,10 @@
+=== NeuroSwap Baseline ===
+Memory: 16 MiB
+Iterations: 3
+Pattern: sequential
+Allocated bytes: 16777216
+Execution time: 80.165 ms
+Minor page faults: 4097
+Major page faults: 0
+Max RSS: 19772 KiB
+Checksum: 13541042048941948928

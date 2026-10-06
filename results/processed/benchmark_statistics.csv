@@ -1,0 +1,5 @@
+experiment,mean_execution_time_ms,min_execution_time_ms,max_execution_time_ms,mean_minor_faults,mean_major_faults,mean_max_rss_kib
+baseline,72.281,66.387,80.165,4097.000,0.000,19804.000
+pinned,71.270,66.375,77.173,4097.000,0.000,19818.400
+file_backed_no_hint,143.412,130.317,154.734,512.000,1.000,19895.200
+file_backed_willneed,150.735,142.009,165.013,511.200,1.000,19934.400

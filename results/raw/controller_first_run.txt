@@ -1,0 +1,22 @@
+=== NeuroSwap Controller ===
+Rule-based controller: configuration-driven, not predictive.
+
+Workload:
+Memory: 16 MiB
+Iterations: 3
+Pattern: sequential
+Type: memory-sensitive (configured)
+
+Controller decision:
+Mode: PINNED
+Reason: memory-sensitive workload selected; attempt bounded mlock()
+
+Experiment output:
+mlock(): mlock() succeeded
+Pinned bytes: 16777216
+munlock(): munlock() succeeded
+Execution time: 160.818 ms
+Minor page faults: 4097
+Major page faults: 0
+Max RSS: 19964 KiB
+Checksum: 13541042048941948928

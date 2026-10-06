@@ -1,0 +1,14 @@
+=== NeuroSwap Pinned ===
+Memory: 16 MiB
+Iterations: 3
+Pattern: sequential
+Allocated bytes: 16777216
+Execution time: 77.173 ms
+Minor page faults: 4097
+Major page faults: 0
+Max RSS: 19792 KiB
+mlock(): mlock() succeeded
+Pinned bytes: 16777216
+RLIMIT_MEMLOCK soft limit: 67108864 bytes
+munlock(): munlock() succeeded
+Checksum: 13541042048941948928

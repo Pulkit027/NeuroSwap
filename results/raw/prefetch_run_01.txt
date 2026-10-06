@@ -1,0 +1,25 @@
+=== NeuroSwap Prefetch Experiment ===
+File: results/raw/prefetch_test_data.bin
+File size: 16 MiB
+Iterations: 3
+Pattern: sequential
+File preparation: deterministic test file created
+MADV_WILLNEED is an advisory hint; it does not guarantee prefetched pages.
+--- Without prefetch hint ---
+Execution time: 148.225 ms
+Minor page faults: 512
+Major page faults: 1
+Max RSS: 19920 KiB
+Cache-reset advice: posix_fadvise(POSIX_FADV_DONTNEED) accepted
+madvise(): not requested
+Cleanup: munmap() and close() succeeded
+Checksum: 10389750941258612736
+--- With MADV_WILLNEED ---
+Execution time: 142.009 ms
+Minor page faults: 511
+Major page faults: 1
+Max RSS: 19984 KiB
+Cache-reset advice: posix_fadvise(POSIX_FADV_DONTNEED) accepted
+madvise(): madvise(MADV_WILLNEED) succeeded
+Cleanup: munmap() and close() succeeded
+Checksum: 10389750941258612736
