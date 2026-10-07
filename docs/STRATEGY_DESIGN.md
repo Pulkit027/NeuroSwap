@@ -84,15 +84,10 @@ copy is actually read during compute. This is one more reason to use
 
 ### Still to measure
 
-1. Anonymous peak with `--no-repack` for a long prompt (only a 9-token prompt and
-   one user snapshot of unrecorded prompt length were measured). No root needed:
-   ```
-   ~/tools/llama.cpp/build/bin/llama-completion -m ~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
-     -f <file with the wc0225 prompt> -n 64 -c 2048 -t 4 --seed 42 --temp 0 -no-cnv --no-repack &
-   sleep 20; grep -E 'Rss|Anonymous' /proc/$!/smaps_rollup; wait
-   ```
-2. Root's memlock limits under sudo: `sudo sh -c 'ulimit -l; ulimit -Hl'`
-   (the user's own soft limit is 65536 kB).
+1. ~~Anonymous peak with `--no-repack` for a long prompt.~~ Measured in
+   `docs/CALIBRATION.md`: 182,156 kB (177.9 MiB) for wc0225 (1171 tokens).
+2. ~~Root's memlock limits under sudo.~~ Measured: 758,604 KiB soft and hard
+   (section 3).
 3. Why only ~208 MiB of file pages stayed resident at the end of the 1200M run
    when anon (774) + hot file set (~338) would be ~1112 MiB: record the cgroup's
    `memory.stat` and `memory.peak` at the end of each limited run.
@@ -112,10 +107,9 @@ Today they only act on the synthetic in-process workload (`neuroswap_pinned`,
 - **Pin:** `FileMapping` can map the .gguf (MAP_PRIVATE read-only pages are
   the shared page-cache pages, nothing is copied). `MemoryPinner::lock` accepts
   any sub-range (`data() + offset`, needs a `const_cast`). Missing pieces: a
-  page-aligned range API, a touch pass, and a way past the RLIMIT pre-check: as
-  root the kernel does not apply RLIMIT_MEMLOCK (CAP_IPC_LOCK), but `lock()`
-  still refuses above the soft limit, so the helper raises the soft limit with
-  `setrlimit` first and records old and new values.
+  page-aligned range API and a touch pass. `lock()` refuses above the
+  RLIMIT_MEMLOCK soft limit; the helper does not raise the limit (section 3)
+  and refuses larger pins itself, before calling `lock()`.
 - **Prefetch:** needs `advise_willneed(offset, length)` for ranges; the
   whole-file version stays as is.
 - **Verification:** a new residency function wrapping `mincore()` over a range.
@@ -133,10 +127,10 @@ Today they only act on the synthetic in-process workload (`neuroswap_pinned`,
 | mmap-served set read every token (all tensors except `token_embd`) | ~934.7 MiB | inferred |
 | RssAnon, `--no-repack`, short prompt | 110.4-112 MiB | measured, single snapshots |
 | RssAnon growth from 25 to 1171 prompt tokens | +64.1 MiB | measured with repack on (710.3 -> 774.4) |
-| RssAnon, `--no-repack`, 1171-token prompt | ~175 MiB | inferred (110.4 + 64.1); to be measured |
+| RssAnon, `--no-repack`, 1171-token prompt | 177.9 MiB (182,156 kB) | measured, single runs (`docs/CALIBRATION.md`) |
 | other file-backed RSS (binary, libraries) | ~13 MiB | measured |
 | safety margin for kernel memory charged to the cgroup | 64 MiB | assumption, not measured |
-| RLIMIT_MEMLOCK | user soft 64 MiB; root under sudo unknown | root has CAP_IPC_LOCK, so the kernel does not apply it; `MemoryPinner::lock` still checks it, the helper raises it |
+| RLIMIT_MEMLOCK, root under sudo | 758,604 KiB (740.8 MiB), soft = hard | measured (`ulimit -l` / `ulimit -Hl` under sudo); user's own soft limit is 64 MiB |
 
 ### Rules
 
@@ -146,30 +140,46 @@ unpinned weights also need room to cycle through the page cache, otherwise
 pinning makes thrashing worse than baseline.
 
     room(L)   = L - peak_anon - other_rss - margin
-    pin_cap   = room(L)                 (helper refuses anything above this)
-    left(L,p) = room(L) - pinned(p)     (page cache left for unpinned weights)
+    pin_cap   = min(room(L), 740.8 MiB)   (RLIMIT_MEMLOCK under sudo)
+    left(L,p) = room(L) - pinned(p)       (page cache left for unpinned weights)
+
+A pin request above `pin_cap` is refused before any `mlock` call, with a clear
+message naming which bound was exceeded (`room(L)` or RLIMIT_MEMLOCK) and both
+values, and the run is recorded as a strategy setup failure (no fallback).
+
+Policy note: the 740.8 MiB memlock limit is treated as a fixed cap and is not
+raised. A root process normally has CAP_SYS_RESOURCE (may raise the hard limit)
+and CAP_IPC_LOCK (the kernel then does not apply RLIMIT_MEMLOCK to `mlock`),
+so this is a project rule, not a kernel guarantee. It keeps the
+pin bound explicit and the same as `MemoryPinner::lock`'s own check.
 
 Fractions are of the ~934.7 MiB mmap-served set, chosen in file-offset order:
 25% ≈ 234 MiB, 50% ≈ 467 MiB, 75% ≈ 701 MiB.
 
-### Budget table (inferred, long-prompt anon estimate of 175 MiB)
+### Budget table (calibrated levels)
 
-| memory.max | room | 25% (234) left | 50% (467) left | 75% (701) left |
-|---|---|---|---|---|
-| 1200M | 948 | 714 | 481 | 247 |
-| 1100M | 848 | 614 | 381 | 147 |
-| 1000M | 748 | 514 | 281 | 47 (too tight) |
-| 900M | 648 | 414 | 181 | over cap: refuse |
-| 800M | 548 | 314 | 81 (too tight) | over cap: refuse |
+Inputs: peak anon 177.9 MiB (measured, 1171-token prompt), other_rss 13 MiB
+(measured), margin 64 MiB (assumption), memlock 740.8 MiB (measured).
+Fractions of 934.7 MiB: 25% = 233.7, 50% = 467.4, 75% = 701.0 MiB.
+Levels from `docs/CALIBRATION.md`.
 
-At 1200M, pinning 25/50/75% does not risk OOM by this arithmetic; the largest
-safe pin is about 948 MiB minus whatever the unpinned pages need.
+| memory.max | room(L) | pin_cap | binding bound | 25% left | 50% left | 75% left |
+|---|---|---|---|---|---|---|
+| none | unbounded | 740.8 | memlock | n/a | n/a | n/a |
+| 1100M | 845.1 | 740.8 | memlock | 611.4 | 377.7 | 144.1 |
+| 1000M | 745.1 | 740.8 | memlock (by 4.3 MiB) | 511.4 | 277.7 | 44.1 (too tight) |
 
-Important: with `--no-repack` the whole per-token working set is roughly
-935 + 175 + 13 ≈ 1,123 MiB plus touched embedding rows. So 1200M may no
-longer be a pressure level at all. The Phase 1 budget levels (1200M, 1100M)
-were measured with repack on and **must be re-derived** with a `--no-repack`
-baseline sweep before choosing the limits for the pin/prefetch matrix.
+- **1100M:** 25%, 50% and 75% are all below `pin_cap` and feasible.
+- **1000M:** all three are below `pin_cap`, but 75% leaves only 44.1 MiB of page
+  cache for the remaining ~234 MiB of mmap-served weights plus the embedding
+  rows, and the 64 MiB margin it relies on is an assumption. 75% at 1000M is
+  not recommended; 25% and 50% are feasible.
+- **none:** no cgroup bound; only the memlock cap applies (all three fractions
+  are below 740.8 MiB).
+- 100% of the mmap-served set (934.7 MiB) exceeds the memlock cap at every level
+  and is refused.
+- These are computed bounds, not measured outcomes; whether pinning helps or
+  hurts at these levels is what the experiments will measure.
 
 ### For reference: repack on (not used in Phase 3)
 
@@ -190,7 +200,7 @@ fraction, the computed cap, the inputs used, and the bytes actually locked.
 - `madvise(MADV_WILLNEED)` is advisory: the kernel may ignore it, read ahead
   asynchronously, or evict the pages again. Effects must be measured (mincore),
   never assumed.
-- `mlock` is bounded: by RLIMIT_MEMLOCK (lifted for root), by the cgroup's
+- `mlock` is bounded: by RLIMIT_MEMLOCK (740.8 MiB under sudo, kept as a fixed cap), by the cgroup's
   memory.max (locked pages are charged) and by available RAM. It does not
   reserve memory; it only keeps faulted-in pages resident.
 - NeuroSwap does not replace or bypass the kernel's memory management.
@@ -224,7 +234,8 @@ fraction, the computed cap, the inputs used, and the bytes actually locked.
 3. Helper: open + mmap the .gguf read-only; `mincore` snapshot; for each
    selected range: `madvise(WILLNEED)`, read one byte per page, then
    (pin) `mlock`; `mincore` again; read `VmLck`. Prints one JSON line `ready`
-   with requested/locked bytes, residency before/after, rlimit values, timings.
+   with requested/locked bytes, `pin_cap` and its inputs, RLIMIT_MEMLOCK,
+   residency before/after, timings.
 4. `run_one` waits for `ready` (timeout, e.g. 120 s). If the helper fails or
    times out: write a record with `error = "strategy setup failed: ..."`, kill
    the helper, do **not** run llama, no fallback to baseline.
@@ -271,7 +282,7 @@ since readahead is asynchronous.
 | OOM from pinning too much | cap from measured anon peak + margin; start at 25% |
 | OOM killer picks the helper instead of llama | record both exit statuses; mark run invalid |
 | helper's own memory charged to the cgroup | C++ helper (small RSS); report its peak RSS |
-| root memlock soft limit too small | helper raises it via `setrlimit`, records values |
+| pin request above RLIMIT_MEMLOCK (740.8 MiB) | refused before `mlock` with a clear message; limit not raised |
 | stale cgroup or leftover helper | `finally` kill + rmdir; refuse to start if `neuroswap_run` exists (already done) |
 | prefetch shows no effect because llama already populates | report as a finding; try the during-decode variant |
 | repack silently on (flag ignored or changed upstream) | record `"repack"` and check the `-lv 4` log has no `CPU_REPACK` buffer; mark run invalid otherwise |
@@ -284,5 +295,7 @@ since readahead is asynchronous.
    `FileMapping` (Review-2 modules and tests unchanged).**
 3. Cold start: **decided, `--cold` is required for every `--memory-limit` run**
    (enforcement in `run_one.py` not implemented yet).
-4. New budget levels from a `--no-repack` baseline sweep: needed before the
-   pin/prefetch matrix.
+4. Budget levels: **decided from the `--no-repack` calibration**: none, 1100M,
+   1000M (`docs/CALIBRATION.md`).
+5. RLIMIT_MEMLOCK: **decided, kept at the measured 740.8 MiB and not raised**;
+   pins above `min(room(L), 740.8 MiB)` are refused.
