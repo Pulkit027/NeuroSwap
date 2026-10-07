@@ -16,6 +16,7 @@ import datetime
 import hashlib
 import json
 import os
+import pwd
 import re
 import resource
 import signal
@@ -25,11 +26,20 @@ import tempfile
 import time
 from pathlib import Path
 
+
+def invoking_user_home():
+    """Home of the user who invoked us, also under sudo (where ~ is /root)."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user:
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+# Repo-relative paths (data, results) come from this file's location.
 REPO = Path(__file__).resolve().parent.parent
-HOME = Path.home()
-LLAMA_DIR = HOME / "tools/llama.cpp"
-LLAMA_BIN = LLAMA_DIR / "build/bin/llama-completion"
-MODEL = HOME / "models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+USER_HOME = invoking_user_home()
+DEFAULT_LLAMA_BIN = USER_HOME / "tools/llama.cpp/build/bin/llama-completion"
+DEFAULT_MODEL = USER_HOME / "models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 CGROUP = Path("/sys/fs/cgroup/neuroswap_run")
 SHA_CACHE = REPO / "results/raw/llm/.model_sha256.json"
 STRATEGIES = ["baseline"]
@@ -66,11 +76,11 @@ def load_prompt(prompt_id):
     die(f"prompt_id {prompt_id} not in data/prompts.jsonl (regenerate with build_prompt_manifest.py)")
 
 
-def model_sha256():
+def model_sha256(model):
     # Cached by size+mtime: hashing reads the whole model and would warm the
     # page cache, so it must never happen between drop_caches and the run.
-    st = MODEL.stat()
-    key = {"path": str(MODEL), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    st = model.stat()
+    key = {"path": str(model), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
     try:
         cached = json.loads(SHA_CACHE.read_text())
         if {k: cached.get(k) for k in key} == key:
@@ -78,7 +88,7 @@ def model_sha256():
     except (OSError, ValueError, KeyError):
         pass
     h = hashlib.sha256()
-    with open(MODEL, "rb") as f:
+    with open(model, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     SHA_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -86,9 +96,13 @@ def model_sha256():
     return h.hexdigest()
 
 
-def llama_commit():
+def llama_commit(llama_bin):
+    # The binary lives inside the llama.cpp checkout (build/bin). safe.directory
+    # lets git read a checkout owned by the invoking user when we run as root.
+    src = llama_bin.resolve().parent
     try:
-        return subprocess.run(["git", "-C", str(LLAMA_DIR), "rev-parse", "HEAD"],
+        return subprocess.run(["git", "-c", "safe.directory=*", "-C", str(src),
+                               "rev-parse", "HEAD"],
                               capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -213,6 +227,20 @@ def join_cgroup():
         f.write("0")
 
 
+def give_back_to_invoking_user(paths):
+    """Under sudo, chown files we created back to SUDO_UID/SUDO_GID (not recursive)."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if os.geteuid() != 0 or uid is None or gid is None:
+        return
+    for p in dict.fromkeys(paths):
+        try:
+            os.chown(p, int(uid), int(gid), follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"run_one: warning: could not chown {p}: {e}", file=sys.stderr)
+
+
 def drop_caches():
     os.sync()
     with open("/proc/sys/vm/drop_caches", "w") as f:
@@ -221,7 +249,7 @@ def drop_caches():
 
 def run(args, prompt_text, record):
     use_cgroup = args.memory_limit != "none"
-    record["model_sha256"] = model_sha256()  # before drop_caches, see model_sha256()
+    record["model_sha256"] = model_sha256(args.model)  # before drop_caches, see model_sha256()
     if args.cold:
         drop_caches()
     if use_cgroup:
@@ -230,7 +258,7 @@ def run(args, prompt_text, record):
     with tempfile.TemporaryDirectory(prefix="neuroswap_run_") as tmp:
         prompt_file = Path(tmp) / "prompt.txt"
         prompt_file.write_text(prompt_text)
-        cmd = [str(LLAMA_BIN), "-m", str(MODEL), "-f", str(prompt_file), "-n", "64",
+        cmd = [str(args.llama_bin), "-m", str(args.model), "-f", str(prompt_file), "-n", "64",
                "-c", "2048", "-t", "4", "--seed", "42", "--temp", "0", "-no-cnv"]
         record["command"] = [c if c != str(prompt_file) else "<prompt_file>" for c in cmd]
         # Generated text goes to a temp file that is deleted with tmp; it echoes the prompt.
@@ -297,6 +325,10 @@ def main():
     ap.add_argument("--run-index", type=int, required=True)
     ap.add_argument("--cold", action="store_true", help="sync and drop page cache first (root)")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--model", type=Path, default=DEFAULT_MODEL,
+                    help=f"GGUF model (default {DEFAULT_MODEL})")
+    ap.add_argument("--llama-bin", type=Path, default=DEFAULT_LLAMA_BIN,
+                    help=f"llama-completion binary (default {DEFAULT_LLAMA_BIN})")
     ap.add_argument("--timeout", type=float, default=900, help="seconds before kill")
     args = ap.parse_args()
 
@@ -307,6 +339,12 @@ def main():
     if needs_root and os.geteuid() != 0:
         die(f"{' and '.join(needs_root)} require root (cgroup / drop_caches). "
             "Run this command yourself with sudo, using the .venv python.")
+
+    # Fail on missing inputs before any cgroup is created or cache dropped.
+    if not args.model.is_file():
+        die(f"model not found: {args.model} (pass --model)")
+    if not (args.llama_bin.is_file() and os.access(args.llama_bin, os.X_OK)):
+        die(f"llama-completion not found or not executable: {args.llama_bin} (pass --llama-bin)")
 
     meta, prompt_text = load_prompt(args.prompt_id)
     record = {
@@ -321,8 +359,8 @@ def main():
         "memory_limit": args.memory_limit,
         "cold": args.cold,
         "run_index": args.run_index,
-        "llama_cpp_commit": llama_commit(),
-        "model": MODEL.name,
+        "llama_cpp_commit": llama_commit(args.llama_bin),
+        "model": args.model.name,
         "cgroup_memory_events": None,  # stays null when --memory-limit none
         "error": None,
     }
@@ -334,6 +372,7 @@ def main():
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "a") as f:
             f.write(json.dumps(record) + "\n")
+        give_back_to_invoking_user([args.out, args.out.parent, SHA_CACHE.parent, SHA_CACHE])
     if record["error"]:
         print(f"run_one: {args.prompt_id} run {args.run_index}: ERROR {record['error']}",
               file=sys.stderr)
