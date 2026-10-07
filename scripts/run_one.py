@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run one manifest prompt through llama.cpp and append one telemetry record.
 
-The prompt is fed raw (no chat template, -no-cnv), exactly as in Phase 1.
+The prompt is fed raw (no chat template, -no-cnv), as in Phase 1. Unlike
+Phase 1, weight repacking is off by default (--no-repack), so all weights stay
+file-backed; --repack on restores llama.cpp's default.
 Only the baseline strategy exists so far: no pinning, no prefetch.
 
 --memory-limit other than "none" and --cold need root (cgroup v2 writes and
@@ -260,6 +262,8 @@ def run(args, prompt_text, record):
         prompt_file.write_text(prompt_text)
         cmd = [str(args.llama_bin), "-m", str(args.model), "-f", str(prompt_file), "-n", "64",
                "-c", "2048", "-t", "4", "--seed", "42", "--temp", "0", "-no-cnv"]
+        if args.repack == "off":
+            cmd.append("--no-repack")
         record["command"] = [c if c != str(prompt_file) else "<prompt_file>" for c in cmd]
         # Generated text goes to a temp file that is deleted with tmp; it echoes the prompt.
         with open(Path(tmp) / "stdout.txt", "w") as out_f, \
@@ -322,6 +326,9 @@ def main():
     ap.add_argument("--memory-limit", required=True,
                     help='cgroup memory.max value, e.g. 1200M, or "none"')
     ap.add_argument("--strategy", required=True, choices=STRATEGIES)
+    ap.add_argument("--repack", choices=["on", "off"], default="off",
+                    help="llama.cpp weight repacking; off (default) passes --no-repack "
+                         "so all weights stay file-backed")
     ap.add_argument("--run-index", type=int, required=True)
     ap.add_argument("--cold", action="store_true", help="sync and drop page cache first (root)")
     ap.add_argument("--out", type=Path, required=True)
@@ -356,6 +363,7 @@ def main():
         "prompt_tokens": int(meta["token_count"]),
         "prompt_format": "raw text, no chat template (-no-cnv)",
         "strategy": args.strategy,
+        "repack": args.repack,
         "memory_limit": args.memory_limit,
         "cold": args.cold,
         "run_index": args.run_index,
