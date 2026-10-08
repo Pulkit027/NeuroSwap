@@ -265,6 +265,40 @@ A pin run that fails the first two checks is recorded with
 For prefetch: residency of the target ranges at `ready` and at llama start,
 since readahead is asynchronous.
 
+### Prefetch is asynchronous: wait for residency before starting llama.cpp
+
+Observation (single runs, not a benchmark): `neuroswap_strategy --strategy
+prefetch` on an 8 MiB temp file (2048 pages, evicted first with
+`posix_fadvise(DONTNEED)`, no root, no cgroup). `madvise(MADV_WILLNEED)`
+returned 0 both times.
+
+| run | resident right after madvise() returned | resident later |
+|---|---|---|
+| 1 (no hold) | 0 / 2048 | not measured |
+| 2 (`--hold`, stdin closed after ~1 s) | 1024 / 2048 | 2048 / 2048 after 988.6 ms |
+
+So the hint was acted on, but the pages arrive after `madvise()` returns, and
+how many are resident at that moment varied between the two runs.
+
+Rule: `run_one.py` must not launch llama.cpp as soon as the helper reports
+ready. It waits until the helper's `mincore()` residency of the target ranges
+reaches the target or stops increasing, with a timeout, and only then starts
+llama.cpp.
+
+- The wait (helper start to llama.cpp start) is recorded as setup cost and
+  included in the strategy's end-to-end time, never hidden.
+- Target: 100% of the target ranges. Under a memory limit the whole file may
+  not fit (1100M, 1000M), so the wait also ends when residency has not grown
+  for a fixed interval (plateau); the reached residency is recorded.
+- On timeout: record `residency_wait_timed_out = true` and the residency
+  reached, and mark the run `strategy_effective = false` (excluded from
+  strategy-vs-baseline comparisons). No retry, no silent fallback.
+- Pin: `mlock()` faults pages in synchronously, so residency should already be
+  100% at ready; the same check confirms it.
+- Not implemented yet: the helper currently measures residency only at
+  `madvise()`/`mlock()` return and at release. Polling (or a helper-side
+  wait-until-resident option) is needed before `run_one.py` can apply this rule.
+
 ### Rules for the experiment matrix
 
 - Limited runs must be cold. In a warm run the model's page-cache pages are
