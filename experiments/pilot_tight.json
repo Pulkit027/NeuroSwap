@@ -1,0 +1,16 @@
+{
+  "plan_name": "pilot_tight",
+  "description": "Pilot at the severe level (1000M), one prompt per bucket. Not a result.",
+  "prompts": {"per_bucket": 1, "seed": 42, "manifest": "data/manifest.csv"},
+  "memory_limits": ["1000M"],
+  "strategies": [
+    {"strategy": "baseline"},
+    {"strategy": "prefetch"},
+    {"strategy": "pin", "fraction": 0.25},
+    {"strategy": "pin", "fraction": 0.5}
+  ],
+  "repetitions": 3,
+  "order_seed": 7,
+  "repack": "off",
+  "output": "results/raw/llm/pilot_tight.jsonl"
+}

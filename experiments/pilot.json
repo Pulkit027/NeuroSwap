@@ -1,0 +1,16 @@
+{
+  "plan_name": "pilot",
+  "description": "Pilot: noise, run time and whether any condition differs at none and 1100M. Not a result.",
+  "prompts": {"per_bucket": 3, "seed": 42, "manifest": "data/manifest.csv"},
+  "memory_limits": ["none", "1100M"],
+  "strategies": [
+    {"strategy": "baseline"},
+    {"strategy": "prefetch"},
+    {"strategy": "pin", "fraction": 0.25},
+    {"strategy": "pin", "fraction": 0.5}
+  ],
+  "repetitions": 3,
+  "order_seed": 7,
+  "repack": "off",
+  "output": "results/raw/llm/pilot.jsonl"
+}
