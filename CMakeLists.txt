@@ -11,6 +11,8 @@ add_library(neuroswap_core
     src/pinner/memory_pinner.cpp
     src/prefetcher/file_mapping.cpp
     src/profiler/measurement.cpp
+    src/strategy/gguf_layout.cpp
+    src/strategy/strategy.cpp
     src/workload/memory_workload.cpp
 )
 
@@ -30,6 +32,9 @@ target_link_libraries(neuroswap_prefetch PRIVATE neuroswap_core)
 add_executable(neuroswap_controller src/controller_main.cpp)
 target_link_libraries(neuroswap_controller PRIVATE neuroswap_core)
 
+add_executable(neuroswap_strategy src/strategy_main.cpp)
+target_link_libraries(neuroswap_strategy PRIVATE neuroswap_core)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(memory_workload_test tests/memory_workload_test.cpp)
@@ -44,4 +49,7 @@ if(BUILD_TESTING)
     add_executable(controller_test tests/controller_test.cpp)
     target_link_libraries(controller_test PRIVATE neuroswap_core)
     add_test(NAME controller_test COMMAND controller_test)
+    add_executable(strategy_test tests/strategy_test.cpp)
+    target_link_libraries(strategy_test PRIVATE neuroswap_core)
+    add_test(NAME strategy_test COMMAND strategy_test)
 endif()

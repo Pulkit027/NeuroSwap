@@ -61,7 +61,7 @@ OperationResult advise_drop_file_cache(const std::string& path) {
     return {true, 0, "posix_fadvise(POSIX_FADV_DONTNEED) accepted"};
 }
 
-OperationResult FileMapping::open_and_map_readonly(const std::string& path) {
+OperationResult FileMapping::open_and_map_readonly(const std::string& path, MapSharing sharing) {
     close();
     file_descriptor_ = open(path.c_str(), O_RDONLY);
     if (file_descriptor_ < 0) return errno_result("open(" + path + ")");
@@ -69,7 +69,8 @@ OperationResult FileMapping::open_and_map_readonly(const std::string& path) {
     if (fstat(file_descriptor_, &status) != 0) { const auto failure = errno_result("fstat(" + path + ")"); close(); return failure; }
     if (status.st_size <= 0) { close(); return {false, EINVAL, "mmap() was not attempted: file size is zero"}; }
     size_bytes_ = static_cast<std::size_t>(status.st_size);
-    address_ = mmap(nullptr, size_bytes_, PROT_READ, MAP_PRIVATE, file_descriptor_, 0);
+    const int flags = sharing == MapSharing::Shared ? MAP_SHARED : MAP_PRIVATE;
+    address_ = mmap(nullptr, size_bytes_, PROT_READ, flags, file_descriptor_, 0);
     if (address_ == MAP_FAILED) { address_ = nullptr; const auto failure = errno_result("mmap(" + path + ")"); close(); return failure; }
     return {true, 0, "mmap() succeeded"};
 }

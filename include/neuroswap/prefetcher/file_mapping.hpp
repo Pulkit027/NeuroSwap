@@ -14,6 +14,10 @@ struct OperationResult {
     std::string message;
 };
 
+// Private is the original Review-2 behaviour. Shared maps the same page-cache
+// pages a MAP_SHARED reader (llama.cpp) uses; read-only, so nothing is copied.
+enum class MapSharing { Private, Shared };
+
 class FileMapping {
 public:
     FileMapping() = default;
@@ -21,7 +25,8 @@ public:
     FileMapping(const FileMapping&) = delete;
     FileMapping& operator=(const FileMapping&) = delete;
 
-    OperationResult open_and_map_readonly(const std::string& path);
+    OperationResult open_and_map_readonly(const std::string& path,
+                                          MapSharing sharing = MapSharing::Private);
     OperationResult advise_willneed() const;
     OperationResult close();
     const void* data() const noexcept;

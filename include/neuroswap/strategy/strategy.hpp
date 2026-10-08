@@ -1,0 +1,136 @@
+#pragma once
+
+#include "neuroswap/prefetcher/file_mapping.hpp"
+#include "neuroswap/strategy/gguf_layout.hpp"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace neuroswap::strategy {
+
+enum class Strategy { Baseline, Prefetch, Pin };
+Strategy parse_strategy(const std::string& value);
+const char* strategy_name(Strategy strategy);
+
+inline constexpr int kExitOk = 0;
+inline constexpr int kExitError = 1;
+inline constexpr int kExitUsage = 2;
+inline constexpr int kExitCapRefused = 3;
+
+inline constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+
+// Inputs to pin_cap = min(room(L), memlock policy, this process's RLIMIT_MEMLOCK),
+// room(L) = memory.max - peak_anon - other_rss - margin (docs/STRATEGY_DESIGN.md
+// section 3). Defaults are the documented values.
+struct PinBudget {
+    std::optional<std::uint64_t> memory_max_bytes;           // nullopt: no cgroup limit
+    std::uint64_t peak_anon_bytes{182156ULL * 1024ULL};       // measured, docs/CALIBRATION.md
+    std::uint64_t other_rss_bytes{13ULL * kMiB};              // measured
+    std::uint64_t margin_bytes{64ULL * kMiB};                 // assumption
+    std::uint64_t memlock_policy_bytes{758604ULL * 1024ULL};  // measured root limit, kept fixed
+    std::optional<std::uint64_t> memlock_rlimit_bytes;        // nullopt: unlimited
+};
+
+struct CapDecision {
+    bool allowed{false};
+    std::uint64_t requested_bytes{};
+    std::uint64_t pin_cap_bytes{};
+    std::optional<std::uint64_t> room_bytes;  // nullopt: no cgroup limit
+    std::string binding_bound;                // "room(L)", "memlock_policy" or "rlimit_memlock"
+    std::string message;
+};
+
+CapDecision check_pin_cap(const PinBudget& budget, std::uint64_t requested_bytes);
+
+// mincore() residency over page-aligned ranges of a mapping.
+struct Residency {
+    bool measured{false};
+    std::uint64_t pages_total{};
+    std::uint64_t pages_resident{};
+    int error_number{};
+    double percent() const;
+};
+Residency measure_residency(const void* base, const std::vector<ByteRange>& ranges,
+                            std::uint64_t page_size);
+
+struct CallRecord {
+    std::uint64_t offset{};
+    std::uint64_t length{};
+    bool attempted{false};  // false: refused by MemoryPinner before calling the syscall
+    bool success{false};
+    int error_number{};
+    std::string message;
+};
+
+struct StrategyConfig {
+    std::string model_path;
+    Strategy strategy{Strategy::Baseline};
+    std::optional<double> fraction;  // pin only, (0, 1]
+    std::string cgroup_path;         // empty: stay in the current cgroup
+    PinBudget budget;                // memory_max and rlimit are filled in by run()
+};
+
+struct StrategyReport {
+    std::string strategy;
+    std::optional<double> fraction;
+    std::string model_path;
+    std::uint64_t file_size_bytes{};
+    std::uint64_t page_size{};
+    std::string cgroup_path;
+    bool cgroup_joined{false};
+    std::optional<std::uint64_t> rlimit_memlock_soft_bytes;
+
+    std::optional<CallRecord> madvise;
+
+    bool has_selection{false};
+    std::uint32_t gguf_version{};
+    std::uint64_t gguf_tensors{};
+    std::uint64_t weight_set_bytes{};
+    std::vector<ByteRange> selected_ranges;
+    std::optional<PinBudget> budget;
+    std::optional<CapDecision> cap;
+    std::uint64_t bytes_requested{};
+    std::uint64_t bytes_locked{};
+    std::vector<CallRecord> mlock_calls;
+
+    Residency before_file, after_file, before_selected, after_selected;
+    double setup_wall_ms{};
+    long setup_minor_faults{};
+    long setup_major_faults{};
+    std::vector<std::pair<std::string, long long>> helper_status_kb;
+
+    bool held{false};
+    std::string released_by;
+    double held_ms{};
+    Residency final_file, final_selected;
+    std::vector<CallRecord> munlock_calls;
+
+    std::vector<std::string> notes;
+    int exit_code{kExitOk};
+    std::string error;
+};
+
+std::string to_json(const StrategyReport& report);
+
+// One helper run: run() applies the strategy and fills the report; release()
+// takes final residency, munlocks and unmaps (it also happens on destruction).
+class StrategySession {
+public:
+    explicit StrategySession(StrategyConfig config);
+    int run();
+    void release(const std::string& released_by, double held_ms);
+    const StrategyReport& report() const noexcept { return report_; }
+
+private:
+    int finish(int exit_code, std::string error);
+
+    StrategyConfig config_;
+    prefetcher::FileMapping mapping_;
+    std::vector<ByteRange> locked_;
+    StrategyReport report_;
+};
+
+}  // namespace neuroswap::strategy
