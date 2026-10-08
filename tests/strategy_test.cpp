@@ -1,6 +1,8 @@
 #include "neuroswap/strategy/strategy.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -117,6 +119,67 @@ int main() {
         assert(report.after_file.measured && report.after_file.pages_total == 7);
         assert(report.after_file.pages_resident <= report.after_file.pages_total);
         assert(to_json(report).find("advisory") != std::string::npos);
+    }
+
+    // residency wait, deterministic fake measurements for each stop reason.
+    {
+        auto fake = [](std::uint64_t resident) {
+            Residency r;
+            r.measured = true;
+            r.pages_total = 1000;
+            r.pages_resident = resident;
+            return r;
+        };
+
+        // target: reached on the 3rd poll.
+        const std::uint64_t sequence[] = {10, 500, 1000};
+        std::size_t call = 0;
+        const auto target = wait_until_resident([&] { return fake(sequence[call++]); },
+                                                99.0, 5.0, 3.0, std::chrono::milliseconds(1));
+        assert(target.stopped_reason == "target" && !target.timed_out && target.polls == 3);
+        assert(target.residency.pages_resident == 1000);
+
+        // plateau: stuck at 50% (e.g. file does not fit), stops after plateau_s, long before the timeout.
+        const auto plateau = wait_until_resident([&] { return fake(500); },
+                                                 99.0, 5.0, 0.05, std::chrono::milliseconds(5));
+        assert(plateau.stopped_reason == "plateau" && !plateau.timed_out);
+        assert(plateau.wait_ms >= 50.0 && plateau.wait_ms < 5000.0 && plateau.polls >= 2);
+
+        // plateau clock restarts on growth: grows for 5 polls, then stalls.
+        std::uint64_t grow = 0;
+        const auto late = wait_until_resident([&] { grow = std::min<std::uint64_t>(grow + 100, 500); return fake(grow); },
+                                              99.0, 5.0, 0.05, std::chrono::milliseconds(5));
+        assert(late.stopped_reason == "plateau" && late.residency.pages_resident == 500);
+
+        // timeout: keeps growing by one page per poll, never reaches the target or a plateau.
+        std::uint64_t pages = 0;
+        const auto timeout = wait_until_resident([&] { return fake(++pages); },
+                                                 99.0, 0.05, 3.0, std::chrono::milliseconds(5));
+        assert(timeout.stopped_reason == "timeout" && timeout.timed_out);
+        assert(timeout.wait_ms >= 50.0 && timeout.residency.percent() < 99.0);
+
+        // measurement failure: stops at once.
+        const auto failed = wait_until_resident([] { Residency r; r.error_number = 12; return r; },
+                                                99.0, 5.0, 3.0, std::chrono::milliseconds(1));
+        assert(failed.stopped_reason == "measurement_failed" && failed.polls == 1 && !failed.residency.measured);
+    }
+
+    // residency wait on the real temp file through the prefetch session.
+    {
+        auto config = config_for(path, Strategy::Prefetch);
+        config.wait_resident_percent = 100.0;
+        config.wait_timeout_s = 5.0;
+        StrategySession session(config);
+        assert(session.run() == kExitOk);
+        const auto& wait = session.report().residency_wait;
+        assert(wait && wait->residency.measured && wait->residency.pages_total == 7 && wait->polls >= 1);
+        assert(wait->stopped_reason == "target" || wait->stopped_reason == "plateau" ||
+               wait->stopped_reason == "timeout");
+        if (wait->stopped_reason == "target") assert(wait->residency.pages_resident == 7);
+        else assert(wait->residency.percent() < 100.0);
+        const auto json = to_json(session.report());
+        assert(json.find("\"residency_wait\": {") != std::string::npos);
+        assert(json.find("\"stopped_reason\": ") != std::string::npos);
     }
 
     // pin within the cap: 60% of 5 pages = 3 pages.

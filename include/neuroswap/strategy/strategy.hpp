@@ -3,7 +3,9 @@
 #include "neuroswap/prefetcher/file_mapping.hpp"
 #include "neuroswap/strategy/gguf_layout.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -56,6 +58,26 @@ struct Residency {
 Residency measure_residency(const void* base, const std::vector<ByteRange>& ranges,
                             std::uint64_t page_size);
 
+// Polls `measure` every `poll_interval` and stops at the first of:
+//   "target"             percent() >= target_percent
+//   "plateau"            resident pages have not grown for plateau_s
+//   "timeout"            timeout_s has passed
+//   "measurement_failed" mincore() failed (residency.measured is false)
+// The last measurement is returned in `residency`; timed_out == (stopped_reason == "timeout").
+struct WaitResult {
+    double target_percent{};
+    double timeout_s{};
+    double plateau_s{};
+    double wait_ms{};
+    std::uint64_t polls{};
+    std::string stopped_reason;
+    bool timed_out{false};
+    Residency residency;
+};
+WaitResult wait_until_resident(const std::function<Residency()>& measure, double target_percent,
+                               double timeout_s, double plateau_s,
+                               std::chrono::milliseconds poll_interval);
+
 struct CallRecord {
     std::uint64_t offset{};
     std::uint64_t length{};
@@ -70,6 +92,9 @@ struct StrategyConfig {
     Strategy strategy{Strategy::Baseline};
     std::optional<double> fraction;  // pin only, (0, 1]
     std::string cgroup_path;         // empty: stay in the current cgroup
+    std::optional<double> wait_resident_percent;  // prefetch only, (0, 100]
+    double wait_timeout_s{120.0};
+    double wait_plateau_s{3.0};
     PinBudget budget;                // memory_max and rlimit are filled in by run()
 };
 
@@ -84,6 +109,7 @@ struct StrategyReport {
     std::optional<std::uint64_t> rlimit_memlock_soft_bytes;
 
     std::optional<CallRecord> madvise;
+    std::optional<WaitResult> residency_wait;
 
     bool has_selection{false};
     std::uint32_t gguf_version{};

@@ -22,7 +22,8 @@ void on_stop_signal(int signal_number) { g_stop_signal = signal_number; }
 void usage(const char* program) {
     std::cout
         << "Usage: " << program << " --model PATH --strategy baseline|prefetch|pin --report PATH\n"
-        << "       [--fraction F] [--cgroup DIR] [--hold]\n\n"
+        << "       [--fraction F] [--wait-resident P [--wait-timeout S] [--wait-plateau-s S]]\n"
+        << "       [--cgroup DIR] [--hold]\n\n"
         << "Applies one memory strategy to a GGUF model file from a separate process.\n\n"
         << "  --model PATH      GGUF model file (mapped read-only, MAP_SHARED)\n"
         << "  --strategy S      baseline: no advice, no lock; residency observed only\n"
@@ -30,6 +31,13 @@ void usage(const char* program) {
         << "                    pin: touch + mlock() the first F of the per-token weight set\n"
         << "                         (all GGUF tensors except token_embd.weight, file-offset order)\n"
         << "  --fraction F      pin only, 0 < F <= 1\n"
+        << "  --wait-resident P prefetch only: after madvise(), poll mincore() every 10 ms until\n"
+        << "                    at least P percent (0 < P <= 100) of the file is resident\n"
+        << "  --wait-timeout S  prefetch only: stop waiting after S seconds (default 120)\n"
+        << "  --wait-plateau-s S  prefetch only: stop waiting once resident pages have not grown\n"
+        << "                    for S seconds (default 3), e.g. when the file does not fit under\n"
+        << "                    memory.max. residency_wait.stopped_reason records target, plateau\n"
+        << "                    or timeout; none of them is an error\n"
         << "  --cgroup DIR      cgroup v2 directory to join before touching any page; its\n"
         << "                    memory.max sets room(L) (needs permission to write cgroup.procs)\n"
         << "  --hold            after setup print READY and keep pages mapped/locked until stdin\n"
@@ -40,6 +48,20 @@ void usage(const char* program) {
         << "room(L) = memory.max - peak_anon - other_rss - margin (docs/STRATEGY_DESIGN.md).\n"
         << "A pin above pin_cap is refused before any mlock(), with no fallback to baseline.\n\n"
         << "Exit codes: 0 ok, 1 error, 2 usage error, 3 pin refused by pin_cap.\n";
+}
+
+double parse_number(const std::string& value, const char* option) {
+    std::size_t used = 0;
+    double number = 0.0;
+    try {
+        number = std::stod(value, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used != value.size() || !std::isfinite(number)) {
+        throw std::invalid_argument(std::string(option) + " must be a number");
+    }
+    return number;
 }
 
 double parse_fraction(const std::string& value) {
@@ -102,6 +124,8 @@ int main(int argc, char* argv[]) {
     std::string report_path;
     bool hold = false;
     bool has_strategy = false;
+    bool has_wait_timeout = false;
+    bool has_wait_plateau = false;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
@@ -113,6 +137,19 @@ int main(int argc, char* argv[]) {
             else if (argument == "--strategy") { config.strategy = ns::parse_strategy(value); has_strategy = true; }
             else if (argument == "--fraction") config.fraction = parse_fraction(value);
             else if (argument == "--cgroup") config.cgroup_path = value;
+            else if (argument == "--wait-resident") {
+                const double percent = parse_number(value, "--wait-resident");
+                if (percent <= 0.0 || percent > 100.0) throw std::invalid_argument("--wait-resident must be 0 < P <= 100");
+                config.wait_resident_percent = percent;
+            } else if (argument == "--wait-timeout") {
+                config.wait_timeout_s = parse_number(value, "--wait-timeout");
+                if (config.wait_timeout_s <= 0.0) throw std::invalid_argument("--wait-timeout must be > 0");
+                has_wait_timeout = true;
+            } else if (argument == "--wait-plateau-s") {
+                config.wait_plateau_s = parse_number(value, "--wait-plateau-s");
+                if (config.wait_plateau_s <= 0.0) throw std::invalid_argument("--wait-plateau-s must be > 0");
+                has_wait_plateau = true;
+            }
             else if (argument == "--report") report_path = value;
             else throw std::invalid_argument("unknown option: " + argument);
         }
@@ -124,6 +161,14 @@ int main(int argc, char* argv[]) {
         }
         if (config.strategy != ns::Strategy::Pin && config.fraction) {
             throw std::invalid_argument("--fraction is only valid with --strategy pin");
+        }
+        const bool any_wait = config.wait_resident_percent || has_wait_timeout || has_wait_plateau;
+        if (config.strategy != ns::Strategy::Prefetch && any_wait) {
+            throw std::invalid_argument("--wait-resident, --wait-timeout and --wait-plateau-s are only valid "
+                                        "with --strategy prefetch");
+        }
+        if ((has_wait_timeout || has_wait_plateau) && !config.wait_resident_percent) {
+            throw std::invalid_argument("--wait-timeout and --wait-plateau-s require --wait-resident");
         }
     } catch (const std::exception& error) {
         std::cerr << "neuroswap_strategy: " << error.what() << "\n\n";

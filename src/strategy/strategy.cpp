@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <thread>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -266,6 +267,38 @@ Residency measure_residency(const void* base, const std::vector<ByteRange>& rang
     return residency;
 }
 
+WaitResult wait_until_resident(const std::function<Residency()>& measure, double target_percent,
+                               double timeout_s, double plateau_s,
+                               std::chrono::milliseconds poll_interval) {
+    using clock = std::chrono::steady_clock;
+    WaitResult result;
+    result.target_percent = target_percent;
+    result.timeout_s = timeout_s;
+    result.plateau_s = plateau_s;
+    const auto started = clock::now();
+    const auto deadline = started + std::chrono::duration<double>(timeout_s);
+    const auto plateau = std::chrono::duration<double>(plateau_s);
+    std::uint64_t most_resident = 0;
+    auto last_growth = started;
+    while (true) {
+        result.residency = measure();
+        ++result.polls;
+        const auto now = clock::now();
+        if (!result.residency.measured) { result.stopped_reason = "measurement_failed"; break; }
+        if (result.residency.percent() >= target_percent) { result.stopped_reason = "target"; break; }
+        if (result.polls == 1 || result.residency.pages_resident > most_resident) {
+            most_resident = result.residency.pages_resident;
+            last_growth = now;
+        }
+        if (now - last_growth >= plateau) { result.stopped_reason = "plateau"; break; }
+        if (now >= deadline) { result.stopped_reason = "timeout"; break; }
+        std::this_thread::sleep_for(poll_interval);
+    }
+    result.timed_out = result.stopped_reason == "timeout";
+    result.wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    return result;
+}
+
 StrategySession::StrategySession(StrategyConfig config) : config_(std::move(config)) {}
 
 int StrategySession::finish(int exit_code, std::string error) {
@@ -326,7 +359,22 @@ int StrategySession::run() {
                                      syscall_attempted(advice.success, advice.message, "madvise(MADV_WILLNEED) failed"),
                                      advice.success, advice.error_number, advice.message};
         report_.after_file = measure_residency(mapping_.data(), whole_file, page);
-        return done(advice.success ? kExitOk : kExitError, advice.success ? "" : advice.message);
+        if (!advice.success) return done(kExitError, advice.message);
+        if (config_.wait_resident_percent) {
+            report_.notes.push_back(
+                "residency_wait polls mincore() every 10 ms after madvise() and stops when the target "
+                "share of the file is resident, when residency has not grown for plateau_s (e.g. the "
+                "file does not fit under memory.max), or at the timeout; the reason is recorded, not retried.");
+            report_.residency_wait = wait_until_resident(
+                [&] { return measure_residency(mapping_.data(), whole_file, page); },
+                *config_.wait_resident_percent, config_.wait_timeout_s, config_.wait_plateau_s,
+                std::chrono::milliseconds(10));
+            if (!report_.residency_wait->residency.measured) {
+                return done(kExitError, "mincore() failed while waiting for residency: " +
+                                            std::string(std::strerror(report_.residency_wait->residency.error_number)));
+            }
+        }
+        return done(kExitOk, "");
     }
 
     // Pin.
@@ -479,6 +527,17 @@ std::string to_json(const StrategyReport& report) {
                    {"setup_minor_faults", std::to_string(report.setup_minor_faults)},
                    {"setup_major_faults", std::to_string(report.setup_major_faults)},
                    {"madvise", report.madvise ? call_json(*report.madvise, 1) : "null"},
+                   {"residency_wait", report.residency_wait
+                        ? object({{"target_percent", number(report.residency_wait->target_percent, 3)},
+                                  {"timeout_s", number(report.residency_wait->timeout_s, 3)},
+                                  {"plateau_s", number(report.residency_wait->plateau_s, 3)},
+                                  {"stopped_reason", quote(report.residency_wait->stopped_reason)},
+                                  {"wait_ms", number(report.residency_wait->wait_ms, 3)},
+                                  {"polls", std::to_string(report.residency_wait->polls)},
+                                  {"timed_out", boolean(report.residency_wait->timed_out)},
+                                  {"residency", residency_json(report.residency_wait->residency, 2)}},
+                                 1)
+                        : "null"},
                    {"selection", selection},
                    {"pin_budget", report.budget ? object(budget_fields, 1) : "null"},
                    {"bytes_requested", std::to_string(report.bytes_requested)},
