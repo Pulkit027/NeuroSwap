@@ -4,9 +4,15 @@
 The prompt is fed raw (no chat template, -no-cnv), as in Phase 1. Unlike
 Phase 1, weight repacking is off by default (--no-repack), so all weights stay
 file-backed; --repack on restores llama.cpp's default.
-Only the baseline strategy exists so far: no pinning, no prefetch.
+Strategies: baseline runs llama.cpp alone. prefetch and pin first start the
+C++ helper build/neuroswap_strategy (--hold) in the same cgroup, wait for its
+READY line, run llama.cpp exactly as for baseline, then release the helper.
+A helper refusal (exit 3) or failure is recorded as an error and no inference
+runs; there is no fallback to baseline.
 
---memory-limit other than "none" and --cold need root (cgroup v2 writes and
+Runs with a memory limit are cold by default (sync + drop_caches first), so the
+model's page-cache pages are charged to the run's cgroup; --warm turns that off.
+--memory-limit other than "none" and cold runs need root (cgroup v2 writes and
 /proc/sys/vm/drop_caches). They are run by the user, never by automation.
 
 The output record never contains prompt text or generated text.
@@ -21,6 +27,7 @@ import os
 import pwd
 import re
 import resource
+import select
 import signal
 import subprocess
 import sys
@@ -44,7 +51,13 @@ DEFAULT_LLAMA_BIN = USER_HOME / "tools/llama.cpp/build/bin/llama-completion"
 DEFAULT_MODEL = USER_HOME / "models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 CGROUP = Path("/sys/fs/cgroup/neuroswap_run")
 SHA_CACHE = REPO / "results/raw/llm/.model_sha256.json"
-STRATEGIES = ["baseline"]
+STRATEGIES = ["baseline", "prefetch", "pin"]
+HELPER_BIN = REPO / "build/neuroswap_strategy"
+PREFETCH_WAIT_RESIDENT = "99"
+PREFETCH_WAIT_TIMEOUT_S = "120"
+PREFETCH_WAIT_PLATEAU_S = "3"
+HELPER_READY_TIMEOUT_S = 300   # helper setup incl. the prefetch residency wait
+HELPER_RELEASE_TIMEOUT_S = 30
 SAMPLE_INTERVAL_S = 0.1
 STATUS_KEYS = ["VmRSS", "VmHWM", "RssAnon", "RssFile"]
 
@@ -249,57 +262,167 @@ def drop_caches():
         f.write("3")
 
 
+def read_line(pipe, deadline):
+    """One line from a pipe, "" on EOF, None if the deadline passes first."""
+    fd, buf = pipe.fileno(), b""
+    while not buf.endswith(b"\n"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            return None
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode(errors="replace")
+
+
+def read_json_file(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def start_helper(args, tmp, use_cgroup, record):
+    """Start the strategy helper and wait for READY.
+
+    Returns (process, setup_seconds); process is None if the helper refused or
+    failed, in which case record["error"] and record["helper_report"] are set.
+    """
+    report_path = tmp / "helper_report.json"
+    cmd = [str(HELPER_BIN), "--model", str(args.model), "--strategy", args.strategy,
+           "--hold", "--report", str(report_path)]
+    if use_cgroup:
+        cmd += ["--cgroup", str(CGROUP)]
+    if args.strategy == "prefetch":
+        cmd += ["--wait-resident", PREFETCH_WAIT_RESIDENT, "--wait-timeout", PREFETCH_WAIT_TIMEOUT_S,
+                "--wait-plateau-s", PREFETCH_WAIT_PLATEAU_S]
+    if args.strategy == "pin":
+        cmd += ["--fraction", repr(args.pin_fraction)]
+    t0 = time.monotonic()
+    with open(tmp / "helper_stderr.txt", "w") as err_f:
+        # Joins the cgroup before exec too, so the helper's own startup is charged there.
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err_f,
+                                preexec_fn=join_cgroup if use_cgroup else None)
+    line = read_line(proc.stdout, t0 + HELPER_READY_TIMEOUT_S)
+    setup_s = time.monotonic() - t0
+    if line is not None and line.startswith("READY"):
+        return proc, setup_s
+
+    if line is None and proc.poll() is None:
+        proc.kill()
+        reason = f"no READY within {HELPER_READY_TIMEOUT_S}s, killed"
+    else:
+        reason = None
+    code = proc.wait()
+    record["helper_report"] = read_json_file(report_path)
+    message = (record["helper_report"] or {}).get("error") or reason or \
+        " | ".join((tmp / "helper_stderr.txt").read_text().splitlines()[-3:])
+    kind = "refused by pin_cap" if code == 3 else "failed"
+    record["error"] = f"strategy helper {kind} (exit {code}): {message}; no inference run"
+    return None, setup_s
+
+
+def release_helper(proc, tmp, record):
+    """Close the helper's stdin so it releases its pages, then read its final report."""
+    died_early = proc.poll()
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        code = proc.wait(timeout=HELPER_RELEASE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        code = proc.wait()
+    record["helper_report"] = read_json_file(tmp / "helper_report.json")
+    if record.get("error") is None:
+        if died_early is not None:
+            record["error"] = f"strategy helper exited during inference with {died_early}"
+        elif code != 0:
+            record["error"] = f"strategy helper exited with {code} on release"
+
+
 def run(args, prompt_text, record):
     use_cgroup = args.memory_limit != "none"
+    use_helper = args.strategy != "baseline"
     record["model_sha256"] = model_sha256(args.model)  # before drop_caches, see model_sha256()
     if args.cold:
         drop_caches()
     if use_cgroup:
         cgroup_setup(args.memory_limit)
 
-    with tempfile.TemporaryDirectory(prefix="neuroswap_run_") as tmp:
-        prompt_file = Path(tmp) / "prompt.txt"
-        prompt_file.write_text(prompt_text)
-        cmd = [str(args.llama_bin), "-m", str(args.model), "-f", str(prompt_file), "-n", "64",
-               "-c", "2048", "-t", "4", "--seed", "42", "--temp", "0", "-no-cnv"]
-        if args.repack == "off":
-            cmd.append("--no-repack")
-        record["command"] = [c if c != str(prompt_file) else "<prompt_file>" for c in cmd]
-        # Generated text goes to a temp file that is deleted with tmp; it echoes the prompt.
-        with open(Path(tmp) / "stdout.txt", "w") as out_f, \
-             open(Path(tmp) / "stderr.txt", "w+") as err_f:
-            samples = []
-            status = rusage = None
-            record["system_start"] = system_snapshot()
-            t0 = time.monotonic()
-            try:
-                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out_f,
-                                        stderr=err_f,
-                                        preexec_fn=join_cgroup if use_cgroup else None)
-                deadline = t0 + args.timeout
-                while True:
-                    pid, status, rusage = os.wait4(proc.pid, os.WNOHANG)
-                    if pid:
-                        break
-                    if (s := sample_proc(proc.pid)) is not None:
-                        s["t"] = round(s["t"] - t0, 3)
-                        samples.append(s)
-                    if time.monotonic() > deadline:
-                        proc.kill()
-                        record["error"] = f"timeout after {args.timeout}s, killed"
-                        _, status, rusage = os.wait4(proc.pid, 0)
-                        break
-                    time.sleep(SAMPLE_INTERVAL_S)
-                proc.returncode = os.waitstatus_to_exitcode(status)
-            finally:
-                record["wall_s"] = round(time.monotonic() - t0, 3)
-                record["system_end"] = system_snapshot()
-                if use_cgroup:
-                    record["cgroup_memory_events"] = cgroup_read_events()
-                    cgroup_teardown()
+    helper = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="neuroswap_run_") as tmp:
+            tmp = Path(tmp)
+            setup_s = 0.0
+            if use_helper:
+                helper, setup_s = start_helper(args, tmp, use_cgroup, record)
+                record["strategy_setup_ms"] = round(setup_s * 1000, 3)
+                if helper is None:
+                    # No inference: keep the usual record shape, with nothing measured.
+                    record.update(command=None, system_start=None, wall_s=None, system_end=None,
+                                  exit_code=None, rusage=None, samples=[], n_samples=0,
+                                  llama_perf=None, total_wall_s=round(setup_s, 3))
+                    if use_cgroup:
+                        record["cgroup_memory_events"] = cgroup_read_events()
+                    return
+            else:
+                record["strategy_setup_ms"] = 0.0
 
-            err_f.seek(0)
-            stderr_text = err_f.read()
+            prompt_file = tmp / "prompt.txt"
+            prompt_file.write_text(prompt_text)
+            cmd = [str(args.llama_bin), "-m", str(args.model), "-f", str(prompt_file), "-n", "64",
+                   "-c", "2048", "-t", "4", "--seed", "42", "--temp", "0", "-no-cnv"]
+            if args.repack == "off":
+                cmd.append("--no-repack")
+            record["command"] = [c if c != str(prompt_file) else "<prompt_file>" for c in cmd]
+            # Generated text goes to a temp file that is deleted with tmp; it echoes the prompt.
+            with open(tmp / "stdout.txt", "w") as out_f, \
+                 open(tmp / "stderr.txt", "w+") as err_f:
+                samples = []
+                status = rusage = None
+                record["system_start"] = system_snapshot()
+                t0 = time.monotonic()
+                try:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out_f,
+                                            stderr=err_f,
+                                            preexec_fn=join_cgroup if use_cgroup else None)
+                    deadline = t0 + args.timeout
+                    while True:
+                        pid, status, rusage = os.wait4(proc.pid, os.WNOHANG)
+                        if pid:
+                            break
+                        if (s := sample_proc(proc.pid)) is not None:
+                            s["t"] = round(s["t"] - t0, 3)
+                            samples.append(s)
+                        if time.monotonic() > deadline:
+                            proc.kill()
+                            record["error"] = f"timeout after {args.timeout}s, killed"
+                            _, status, rusage = os.wait4(proc.pid, 0)
+                            break
+                        time.sleep(SAMPLE_INTERVAL_S)
+                    proc.returncode = os.waitstatus_to_exitcode(status)
+                finally:
+                    record["wall_s"] = round(time.monotonic() - t0, 3)
+                    record["inference_wall_s"] = record["wall_s"]
+                    record["total_wall_s"] = round(setup_s + record["wall_s"], 3)
+                    record["system_end"] = system_snapshot()
+                    if use_cgroup:
+                        record["cgroup_memory_events"] = cgroup_read_events()
+
+                err_f.seek(0)
+                stderr_text = err_f.read()
+
+            if helper is not None:
+                release_helper(helper, tmp, record)
+    finally:
+        if helper is not None and helper.poll() is None:
+            helper.kill()
+            helper.wait()
+        if use_cgroup:
+            cgroup_teardown()
 
     record["exit_code"] = proc.returncode
     record["rusage"] = {"ru_minflt": rusage.ru_minflt, "ru_majflt": rusage.ru_majflt,
@@ -326,11 +449,18 @@ def main():
     ap.add_argument("--memory-limit", required=True,
                     help='cgroup memory.max value, e.g. 1200M, or "none"')
     ap.add_argument("--strategy", required=True, choices=STRATEGIES)
+    ap.add_argument("--pin-fraction", type=float,
+                    help="pin only: fraction (0 < F <= 1) of the per-token weight set to mlock")
     ap.add_argument("--repack", choices=["on", "off"], default="off",
                     help="llama.cpp weight repacking; off (default) passes --no-repack "
                          "so all weights stay file-backed")
     ap.add_argument("--run-index", type=int, required=True)
-    ap.add_argument("--cold", action="store_true", help="sync and drop page cache first (root)")
+    ap.add_argument("--cold", action="store_true",
+                    help="sync and drop page cache first (root); default whenever --memory-limit "
+                         "is not none, where this flag is a no-op alias")
+    ap.add_argument("--warm", action="store_true",
+                    help="with --memory-limit: skip the default cache drop (the model's cached "
+                         "pages may then be charged to another cgroup)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model", type=Path, default=DEFAULT_MODEL,
                     help=f"GGUF model (default {DEFAULT_MODEL})")
@@ -341,8 +471,12 @@ def main():
 
     if args.memory_limit != "none" and not re.fullmatch(r"\d+[KMG]?|max", args.memory_limit):
         die(f"bad --memory-limit {args.memory_limit!r}; use e.g. 1200M or none")
+    if args.cold and args.warm:
+        die("--cold and --warm are mutually exclusive")
+    # Effective setting: limited runs are cold unless --warm; unlimited runs only with --cold.
+    args.cold = (not args.warm) if args.memory_limit != "none" else args.cold
     needs_root = [f for f, on in [("--memory-limit " + args.memory_limit, args.memory_limit != "none"),
-                                  ("--cold", args.cold)] if on]
+                                  ("cold start (drop_caches)", args.cold)] if on]
     if needs_root and os.geteuid() != 0:
         die(f"{' and '.join(needs_root)} require root (cgroup / drop_caches). "
             "Run this command yourself with sudo, using the .venv python.")
@@ -352,6 +486,13 @@ def main():
         die(f"model not found: {args.model} (pass --model)")
     if not (args.llama_bin.is_file() and os.access(args.llama_bin, os.X_OK)):
         die(f"llama-completion not found or not executable: {args.llama_bin} (pass --llama-bin)")
+    if args.strategy == "pin":
+        if args.pin_fraction is None or not 0 < args.pin_fraction <= 1:
+            die("--strategy pin requires --pin-fraction with 0 < F <= 1")
+    elif args.pin_fraction is not None:
+        die("--pin-fraction is only valid with --strategy pin")
+    if args.strategy != "baseline" and not (HELPER_BIN.is_file() and os.access(HELPER_BIN, os.X_OK)):
+        die(f"strategy helper not found or not executable: {HELPER_BIN} (build it with cmake --build build)")
 
     meta, prompt_text = load_prompt(args.prompt_id)
     record = {
@@ -371,6 +512,10 @@ def main():
         "model": args.model.name,
         "cgroup_memory_events": None,  # stays null when --memory-limit none
         "error": None,
+        "strategy_setup_ms": None,     # helper setup + residency wait; 0 for baseline
+        "helper_report": None,         # neuroswap_strategy's JSON report, unmodified
+        "inference_wall_s": None,      # llama-completion only (same as wall_s)
+        "total_wall_s": None,          # strategy setup + inference
     }
     try:
         run(args, prompt_text, record)
