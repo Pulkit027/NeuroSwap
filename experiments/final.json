@@ -1,0 +1,21 @@
+{
+  "plan_name": "final",
+  "description": "Final batch: held-out ML test set, all runs cold. Prompts exclude every pilot prompt.",
+  "prompts": {
+    "per_bucket": 3,
+    "seed": 2026,
+    "manifest": "data/manifest.csv",
+    "exclude_plans": ["experiments/pilot.json", "experiments/pilot_tight.json"]
+  },
+  "memory_limits": ["none", "1100M"],
+  "cold_unlimited": true,
+  "strategies": [
+    {"strategy": "baseline"},
+    {"strategy": "prefetch"},
+    {"strategy": "pin", "fraction": 0.25}
+  ],
+  "repetitions": 2,
+  "order_seed": 11,
+  "repack": "off",
+  "output": "results/raw/llm/final.jsonl"
+}

@@ -200,6 +200,49 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("need root", result.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_exclude_plans(self):
+        pilot_ids = set()
+        for name in ("pilot", "pilot_tight"):
+            plan = run_experiment.load_plan(REPO / "experiments" / f"{name}.json")
+            pilot_ids |= {pid for pid, _ in run_experiment.select_prompts(plan)}
+        self.assertEqual(len(pilot_ids), 15)
+        final = run_experiment.load_plan(REPO / "experiments/final.json")
+        selected = run_experiment.select_prompts(final)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual({pid for pid, _ in selected} & pilot_ids, set())
+        self.assertEqual(run_experiment.excluded_prompts(final), pilot_ids)
+        dry = subprocess.run([sys.executable, str(RUNNER), str(REPO / "experiments/final.json"), "--dry-run"],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertIn("overlap with this selection: 0", dry)
+        self.assertIn("144 total", dry)
+        # Asking for more prompts than remain after exclusion is refused.
+        too_many = self.dir / "too_many.json"
+        too_many.write_text(json.dumps(dict(self.plan, prompts=dict(self.plan["prompts"], per_bucket=75,
+                                                                     exclude_plans=["experiments/pilot.json"]))))
+        result = self.runner(plan=too_many)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("eligible prompts", result.stderr)
+
+    def test_cold_unlimited_passes_cold_to_none_runs(self):
+        class Args:
+            python, run_one = "python", Path("run_one.py")
+        run = {"prompt_id": "wc0000", "memory_limit": "none", "strategy": "baseline",
+               "pin_fraction": None, "repetition": 0}
+        cold_plan = dict(self.plan, cold_unlimited=True)
+        self.assertIn("--cold", run_experiment.run_one_cmd(Args, cold_plan, run, Path("o")))
+        self.assertNotIn("--cold", run_experiment.run_one_cmd(Args, self.plan, run, Path("o")))
+        limited = dict(run, memory_limit="1100M")  # cold by default inside run_one.py
+        self.assertNotIn("--cold", run_experiment.run_one_cmd(Args, cold_plan, limited, Path("o")))
+
+    @unittest.skipIf(os.geteuid() == 0, "root may run cold plans")
+    def test_cold_unlimited_needs_root(self):
+        cold = self.dir / "cold.json"
+        cold.write_text(json.dumps(dict(self.plan, cold_unlimited=True)))
+        result = self.runner(plan=cold)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("need root", result.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_bad_plan_refused(self):
         bad = self.dir / "bad.json"
         bad.write_text(json.dumps(dict(self.plan, strategies=[{"strategy": "pin"}])))

@@ -16,7 +16,11 @@ appended to the output, in one write with SIGINT blocked, then fsynced. On
 Ctrl+C or SIGTERM the current run_one is interrupted, its partial record is
 discarded and the run's cgroup is checked and removed if left behind.
 
-Plans with a memory limit need root (run by the user with sudo). The runner
+Plan options: prompts.exclude_plans removes every prompt selected by the
+listed plans before sampling (the overlap is printed and must be 0);
+cold_unlimited = true makes "none" runs cold too (run_one.py --cold).
+
+Plans with a memory limit or cold_unlimited need root (run by the user with sudo). The runner
 refuses to start when the 1-minute load average is above 1.0 unless --force.
 """
 
@@ -40,7 +44,10 @@ RUN_ONE = REPO / "scripts/run_one.py"
 CGROUP = Path("/sys/fs/cgroup/neuroswap_run")  # must match run_one.py
 STRATEGIES = {"baseline", "prefetch", "pin"}
 PLAN_KEYS = {"plan_name", "description", "prompts", "memory_limits", "strategies",
-             "repetitions", "order_seed", "repack", "output"}
+             "repetitions", "order_seed", "repack", "output", "cold_unlimited"}
+OPTIONAL_PLAN_KEYS = {"description", "cold_unlimited"}
+PROMPT_KEYS = {"per_bucket", "seed", "manifest"}
+OPTIONAL_PROMPT_KEYS = {"exclude_plans"}
 MAX_LOAD_1MIN = 1.0
 CHILD_STOP_TIMEOUT_S = 60
 
@@ -59,15 +66,21 @@ def load_plan(path):
     except (OSError, ValueError) as e:
         raise PlanError(f"cannot read plan {path}: {e}")
     unknown = set(plan) - PLAN_KEYS
-    missing = PLAN_KEYS - {"description"} - set(plan)
+    missing = PLAN_KEYS - OPTIONAL_PLAN_KEYS - set(plan)
     if unknown or missing:
         raise PlanError(f"plan keys: unknown {sorted(unknown)}, missing {sorted(missing)}")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(plan["plan_name"])):
         raise PlanError("plan_name must match [A-Za-z0-9_.-]+")
     prompts = plan["prompts"]
-    if set(prompts) != {"per_bucket", "seed", "manifest"} or \
+    if not PROMPT_KEYS <= set(prompts) <= PROMPT_KEYS | OPTIONAL_PROMPT_KEYS or \
             not isinstance(prompts["per_bucket"], int) or prompts["per_bucket"] < 1:
-        raise PlanError('prompts must be {"per_bucket": int >= 1, "seed": int, "manifest": path}')
+        raise PlanError('prompts must be {"per_bucket": int >= 1, "seed": int, "manifest": path, '
+                        'optional "exclude_plans": [plan paths]}')
+    exclude = prompts.get("exclude_plans", [])
+    if not isinstance(exclude, list) or not all(isinstance(e, str) for e in exclude):
+        raise PlanError("prompts.exclude_plans must be a list of plan paths")
+    if not isinstance(plan.get("cold_unlimited", False), bool):
+        raise PlanError("cold_unlimited must be true or false")
     for limit in plan["memory_limits"]:
         if limit != "none" and not re.fullmatch(r"\d+[KMG]?", str(limit)):
             raise PlanError(f"bad memory limit {limit!r}")
@@ -96,9 +109,23 @@ def load_plan(path):
     return plan
 
 
-def select_prompts(plan):
-    """N prompt_ids per bucket, buckets in manifest order, sampled with the plan seed."""
+def excluded_prompts(plan, _chain=()):
+    """prompt_ids selected by every plan in prompts.exclude_plans (recursively)."""
+    excluded = set()
+    for path in plan["prompts"].get("exclude_plans", []):
+        resolved = (REPO / path).resolve()
+        if resolved in _chain:
+            raise PlanError(f"exclude_plans cycle through {path}")
+        other = load_plan(resolved)
+        excluded |= {pid for pid, _ in select_prompts(other, _chain + (resolved,))}
+    return excluded
+
+
+def select_prompts(plan, _chain=()):
+    """N prompt_ids per bucket, buckets in manifest order, sampled with the plan seed
+    from the bucket's prompts minus those of prompts.exclude_plans."""
     manifest = REPO / plan["prompts"]["manifest"]
+    excluded = excluded_prompts(plan, _chain)
     by_bucket = {}
     with open(manifest, newline="") as f:
         for row in csv.DictReader(f):
@@ -106,10 +133,14 @@ def select_prompts(plan):
     rng = random.Random(plan["prompts"]["seed"])
     selected = []
     for bucket, ids in by_bucket.items():
+        candidates = sorted(set(ids) - excluded)
         n = plan["prompts"]["per_bucket"]
-        if n > len(ids):
-            raise PlanError(f"bucket {bucket} has only {len(ids)} prompts, plan wants {n}")
-        selected += [(pid, bucket) for pid in sorted(rng.sample(sorted(ids), n))]
+        if n > len(candidates):
+            raise PlanError(f"bucket {bucket} has only {len(candidates)} eligible prompts, plan wants {n}")
+        selected += [(pid, bucket) for pid in sorted(rng.sample(candidates, n))]
+    overlap = {pid for pid, _ in selected} & excluded
+    if overlap:
+        raise PlanError(f"selected prompts overlap excluded plans: {sorted(overlap)}")
     return selected
 
 
@@ -267,6 +298,8 @@ def run_one_cmd(args, plan, run, out):
            "--repack", plan["repack"], "--run-index", str(run["repetition"]), "--out", str(out)]
     if run["pin_fraction"] is not None:
         cmd += ["--pin-fraction", repr(float(run["pin_fraction"]))]
+    if run["memory_limit"] == "none" and plan.get("cold_unlimited", False):
+        cmd.append("--cold")  # limited runs are cold by default in run_one.py
     return cmd
 
 
@@ -371,7 +404,13 @@ def main():
     for bucket, ids in by_bucket.items():
         print(f"prompts       {bucket:>9}: {' '.join(ids)}")
     print(f"selection     {plan['prompts']['per_bucket']} per bucket, seed {plan['prompts']['seed']}")
-    print(f"memory limits {', '.join(plan['memory_limits'])}  (limited runs are cold; none runs are warm)")
+    if plan["prompts"].get("exclude_plans"):
+        excluded = excluded_prompts(plan)
+        selected = {pid for ids in by_bucket.values() for pid in ids}
+        print(f"excluded      {len(excluded)} prompt ids from {', '.join(plan['prompts']['exclude_plans'])}; "
+              f"overlap with this selection: {len(selected & excluded)}")
+    cold_note = "all runs cold" if plan.get("cold_unlimited") else "limited runs are cold; none runs are warm"
+    print(f"memory limits {', '.join(plan['memory_limits'])}  ({cold_note})")
     print(f"strategies    {strategies}")
     print(f"repetitions   {plan['repetitions']}, order seed {plan['order_seed']}, repack {plan['repack']}")
     print(f"output        {out}")
@@ -387,9 +426,9 @@ def main():
             print(f"{i:>4} {r['run_id']} {label(r)}  {state}")
         return EXIT_OK
 
-    needs_root = any(limit != "none" for limit in plan["memory_limits"])
+    needs_root = plan.get("cold_unlimited", False) or any(limit != "none" for limit in plan["memory_limits"])
     if needs_root and os.geteuid() != 0:
-        print("run_experiment: this plan has memory-limited runs, which need root. Run it yourself:\n"
+        print("run_experiment: this plan has memory-limited or cold runs, which need root. Run it yourself:\n"
               f"  sudo {sys.executable} {' '.join(sys.argv)}", file=sys.stderr)
         return EXIT_REFUSED
     load = os.getloadavg()[0]
