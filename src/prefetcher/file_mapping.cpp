@@ -81,6 +81,18 @@ OperationResult FileMapping::advise_willneed() const {
     return {true, 0, "madvise(MADV_WILLNEED) succeeded"};
 }
 
+OperationResult FileMapping::advise_willneed(std::size_t offset, std::size_t length) const {
+    if (address_ == nullptr || size_bytes_ == 0) return {false, EINVAL, "madvise() was not attempted: no valid mapping"};
+    if (length == 0 || offset > size_bytes_ || length > size_bytes_ - offset ||
+        offset % static_cast<std::size_t>(sysconf(_SC_PAGESIZE)) != 0) {
+        return {false, EINVAL, "madvise() was not attempted: range outside the mapping or not page-aligned"};
+    }
+    if (madvise(static_cast<char*>(address_) + offset, length, MADV_WILLNEED) != 0) {
+        return errno_result("madvise(MADV_WILLNEED)");
+    }
+    return {true, 0, "madvise(MADV_WILLNEED) succeeded"};
+}
+
 OperationResult FileMapping::close() {
     if (address_ != nullptr) {
         if (munmap(address_, size_bytes_) != 0) return errno_result("munmap()");

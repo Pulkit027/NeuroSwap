@@ -73,10 +73,38 @@ struct WaitResult {
     std::string stopped_reason;
     bool timed_out{false};
     Residency residency;
+
+    // Chunked prefetch only (prefetch_in_chunks); chunk_bytes == 0 otherwise.
+    std::uint64_t chunk_bytes{};
+    std::uint64_t chunks_requested{};
+    std::uint64_t chunks_completed{};
+    std::uint64_t madvise_calls{};
+    int madvise_errno{};
+    std::uint64_t bytes_resident_final{};
+    std::optional<std::uint64_t> stopped_chunk_index;  // chunk the loop stopped in, if it stopped early
+    ByteRange stopped_chunk;
+    Residency stopped_chunk_residency;
+    double stopped_chunk_wait_ms{};
+    std::vector<double> chunk_wait_ms;  // per completed chunk: madvise() return to target reached
 };
 WaitResult wait_until_resident(const std::function<Residency()>& measure, double target_percent,
                                double timeout_s, double plateau_s,
                                std::chrono::milliseconds poll_interval);
+
+// Prefetch [0, file_bytes) in chunks of chunk_bytes, using only madvise(MADV_WILLNEED):
+// for each chunk, `advise` it (returns 0 or an errno), then poll `measure` on that chunk
+// until it is at least target_percent resident. Stops at the first of:
+//   "target"             every chunk reached target_percent
+//   "plateau"            a chunk's resident pages did not grow for plateau_s
+//   "timeout"            timeout_s passed (for the whole loop)
+//   "madvise_failed"     `advise` returned an error
+//   "measurement_failed" `measure` failed
+// Then `residency` is `measure` over the whole file and bytes_resident_final its bytes.
+WaitResult prefetch_in_chunks(std::uint64_t file_bytes, std::uint64_t chunk_bytes, std::uint64_t page_size,
+                              const std::function<int(const ByteRange&)>& advise,
+                              const std::function<Residency(const ByteRange&)>& measure,
+                              double target_percent, double timeout_s, double plateau_s,
+                              std::chrono::milliseconds poll_interval);
 
 struct CallRecord {
     std::uint64_t offset{};
@@ -95,6 +123,9 @@ struct StrategyConfig {
     std::optional<double> wait_resident_percent;  // prefetch only, (0, 100]
     double wait_timeout_s{120.0};
     double wait_plateau_s{3.0};
+    // 8 MiB: on this machine one madvise(WILLNEED) brought in at most 8 MiB (the device's
+    // read_ahead_kb), so larger chunks plateaued at 8 MiB (docs/EXPERIMENT_PLAN.md).
+    std::uint64_t prefetch_chunk_bytes{8ULL * 1024ULL * 1024ULL};
     PinBudget budget;                // memory_max and rlimit are filled in by run()
 };
 
@@ -109,6 +140,7 @@ struct StrategyReport {
     std::optional<std::uint64_t> rlimit_memlock_soft_bytes;
 
     std::optional<CallRecord> madvise;
+    std::optional<std::uint64_t> prefetch_chunk_bytes;  // prefetch only
     std::optional<WaitResult> residency_wait;
 
     bool has_selection{false};

@@ -22,7 +22,8 @@ void on_stop_signal(int signal_number) { g_stop_signal = signal_number; }
 void usage(const char* program) {
     std::cout
         << "Usage: " << program << " --model PATH --strategy baseline|prefetch|pin --report PATH\n"
-        << "       [--fraction F] [--wait-resident P [--wait-timeout S] [--wait-plateau-s S]]\n"
+        << "       [--fraction F] [--prefetch-chunk-mib N]\n"
+        << "       [--wait-resident P [--wait-timeout S] [--wait-plateau-s S]]\n"
         << "       [--cgroup DIR] [--hold]\n\n"
         << "Applies one memory strategy to a GGUF model file from a separate process.\n\n"
         << "  --model PATH      GGUF model file (mapped read-only, MAP_SHARED)\n"
@@ -31,10 +32,13 @@ void usage(const char* program) {
         << "                    pin: touch + mlock() the first F of the per-token weight set\n"
         << "                         (all GGUF tensors except token_embd.weight, file-offset order)\n"
         << "  --fraction F      pin only, 0 < F <= 1\n"
-        << "  --wait-resident P prefetch only: after madvise(), poll mincore() every 10 ms until\n"
-        << "                    at least P percent (0 < P <= 100) of the file is resident\n"
-        << "  --wait-timeout S  prefetch only: stop waiting after S seconds (default 120)\n"
-        << "  --wait-plateau-s S  prefetch only: stop waiting once resident pages have not grown\n"
+        << "  --prefetch-chunk-mib N  prefetch only: issue madvise(MADV_WILLNEED) per N MiB chunk\n"
+        << "                    (default 8); madvise is the only prefetch mechanism\n"
+        << "  --wait-resident P prefetch only: after each chunk's madvise(), poll mincore() every\n"
+        << "                    10 ms until that chunk is at least P percent (0 < P <= 100)\n"
+        << "                    resident; the loop stops at the first chunk that does not get there\n"
+        << "  --wait-timeout S  prefetch only: overall limit for the whole chunk loop (default 120)\n"
+        << "  --wait-plateau-s S  prefetch only: stop once a chunk's resident pages have not grown\n"
         << "                    for S seconds (default 3), e.g. when the file does not fit under\n"
         << "                    memory.max. residency_wait.stopped_reason records target, plateau\n"
         << "                    or timeout; none of them is an error\n"
@@ -126,6 +130,7 @@ int main(int argc, char* argv[]) {
     bool has_strategy = false;
     bool has_wait_timeout = false;
     bool has_wait_plateau = false;
+    bool has_chunk = false;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
@@ -145,6 +150,13 @@ int main(int argc, char* argv[]) {
                 config.wait_timeout_s = parse_number(value, "--wait-timeout");
                 if (config.wait_timeout_s <= 0.0) throw std::invalid_argument("--wait-timeout must be > 0");
                 has_wait_timeout = true;
+            } else if (argument == "--prefetch-chunk-mib") {
+                const double mib = parse_number(value, "--prefetch-chunk-mib");
+                if (mib < 1.0 || mib != std::floor(mib) || mib > 1024.0 * 1024.0) {
+                    throw std::invalid_argument("--prefetch-chunk-mib must be a whole number >= 1");
+                }
+                config.prefetch_chunk_bytes = static_cast<std::uint64_t>(mib) * 1024ULL * 1024ULL;
+                has_chunk = true;
             } else if (argument == "--wait-plateau-s") {
                 config.wait_plateau_s = parse_number(value, "--wait-plateau-s");
                 if (config.wait_plateau_s <= 0.0) throw std::invalid_argument("--wait-plateau-s must be > 0");
@@ -163,9 +175,9 @@ int main(int argc, char* argv[]) {
             throw std::invalid_argument("--fraction is only valid with --strategy pin");
         }
         const bool any_wait = config.wait_resident_percent || has_wait_timeout || has_wait_plateau;
-        if (config.strategy != ns::Strategy::Prefetch && any_wait) {
-            throw std::invalid_argument("--wait-resident, --wait-timeout and --wait-plateau-s are only valid "
-                                        "with --strategy prefetch");
+        if (config.strategy != ns::Strategy::Prefetch && (any_wait || has_chunk)) {
+            throw std::invalid_argument("--prefetch-chunk-mib, --wait-resident, --wait-timeout and "
+                                        "--wait-plateau-s are only valid with --strategy prefetch");
         }
         if ((has_wait_timeout || has_wait_plateau) && !config.wait_resident_percent) {
             throw std::invalid_argument("--wait-timeout and --wait-plateau-s require --wait-resident");

@@ -28,6 +28,8 @@ public:
     OperationResult open_and_map_readonly(const std::string& path,
                                           MapSharing sharing = MapSharing::Private);
     OperationResult advise_willneed() const;
+    // madvise(MADV_WILLNEED) on [offset, offset + length); offset must be page-aligned.
+    OperationResult advise_willneed(std::size_t offset, std::size_t length) const;
     OperationResult close();
     const void* data() const noexcept;
     std::size_t size_bytes() const noexcept;

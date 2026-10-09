@@ -193,6 +193,28 @@ std::string call_json(const CallRecord& call, int level) {
                   level);
 }
 
+std::string chunk_waits_json(std::vector<double> waits, int level) {
+    if (waits.empty()) return "null";
+    std::sort(waits.begin(), waits.end());
+    const auto n = waits.size();
+    const double median = n % 2 == 1 ? waits[n / 2] : (waits[n / 2 - 1] + waits[n / 2]) / 2.0;
+    return object({{"n", std::to_string(n)},
+                   {"min", number(waits.front(), 3)},
+                   {"median", number(median, 3)},
+                   {"max", number(waits.back(), 3)}},
+                  level);
+}
+
+std::string stopped_chunk_json(const WaitResult& wait, int level) {
+    if (!wait.stopped_chunk_index) return "null";
+    return object({{"index", std::to_string(*wait.stopped_chunk_index)},
+                   {"offset", std::to_string(wait.stopped_chunk.offset)},
+                   {"length", std::to_string(wait.stopped_chunk.length)},
+                   {"wait_ms", number(wait.stopped_chunk_wait_ms, 3)},
+                   {"residency", residency_json(wait.stopped_chunk_residency, level + 1)}},
+                  level);
+}
+
 std::string calls_json(const std::vector<CallRecord>& calls, int level) {
     std::vector<std::string> items;
     for (const auto& call : calls) items.push_back(call_json(call, level + 1));
@@ -299,6 +321,74 @@ WaitResult wait_until_resident(const std::function<Residency()>& measure, double
     return result;
 }
 
+WaitResult prefetch_in_chunks(std::uint64_t file_bytes, std::uint64_t chunk_bytes, std::uint64_t page_size,
+                              const std::function<int(const ByteRange&)>& advise,
+                              const std::function<Residency(const ByteRange&)>& measure,
+                              double target_percent, double timeout_s, double plateau_s,
+                              std::chrono::milliseconds poll_interval) {
+    using clock = std::chrono::steady_clock;
+    using ms = std::chrono::duration<double, std::milli>;
+    WaitResult result;
+    result.target_percent = target_percent;
+    result.timeout_s = timeout_s;
+    result.plateau_s = plateau_s;
+    result.chunk_bytes = chunk_bytes;
+    result.chunks_requested = chunk_bytes == 0 ? 0 : (file_bytes + chunk_bytes - 1) / chunk_bytes;
+    const auto started = clock::now();
+    const auto deadline = started + std::chrono::duration<double>(timeout_s);
+    const auto plateau = std::chrono::duration<double>(plateau_s);
+
+    for (std::uint64_t index = 0; index < result.chunks_requested && result.stopped_reason.empty(); ++index) {
+        const ByteRange chunk{index * chunk_bytes, std::min(chunk_bytes, file_bytes - index * chunk_bytes)};
+        auto stop_in_chunk = [&](const char* reason, const Residency& residency, clock::time_point since) {
+            result.stopped_reason = reason;
+            result.stopped_chunk_index = index;
+            result.stopped_chunk = chunk;
+            result.stopped_chunk_residency = residency;
+            result.stopped_chunk_wait_ms = ms(clock::now() - since).count();
+        };
+        if (clock::now() >= deadline) {
+            stop_in_chunk("timeout", Residency{}, clock::now());
+            break;
+        }
+        ++result.madvise_calls;
+        if (const int error = advise(chunk); error != 0) {
+            result.madvise_errno = error;
+            stop_in_chunk("madvise_failed", Residency{}, clock::now());
+            break;
+        }
+        const auto chunk_started = clock::now();
+        std::uint64_t most_resident = 0;
+        auto last_growth = chunk_started;
+        for (bool first = true;; first = false) {
+            const auto residency = measure(chunk);
+            ++result.polls;
+            const auto now = clock::now();
+            if (!residency.measured) { stop_in_chunk("measurement_failed", residency, chunk_started); break; }
+            if (residency.percent() >= target_percent) {
+                result.chunk_wait_ms.push_back(ms(now - chunk_started).count());
+                ++result.chunks_completed;
+                break;
+            }
+            if (first || residency.pages_resident > most_resident) {
+                most_resident = residency.pages_resident;
+                last_growth = now;
+            }
+            if (now - last_growth >= plateau) { stop_in_chunk("plateau", residency, chunk_started); break; }
+            if (now >= deadline) { stop_in_chunk("timeout", residency, chunk_started); break; }
+            std::this_thread::sleep_for(poll_interval);
+        }
+    }
+    if (result.stopped_reason.empty()) result.stopped_reason = "target";
+    result.timed_out = result.stopped_reason == "timeout";
+    if (result.stopped_reason != "measurement_failed") {
+        result.residency = measure({0, file_bytes});
+        result.bytes_resident_final = result.residency.pages_resident * page_size;
+    }
+    result.wait_ms = ms(clock::now() - started).count();
+    return result;
+}
+
 StrategySession::StrategySession(StrategyConfig config) : config_(std::move(config)) {}
 
 int StrategySession::finish(int exit_code, std::string error) {
@@ -354,25 +444,38 @@ int StrategySession::run() {
 
     if (config_.strategy == Strategy::Prefetch) {
         report_.notes.push_back(kMadviseNote);
-        const auto advice = mapping_.advise_willneed();
-        report_.madvise = CallRecord{0, report_.file_size_bytes,
-                                     syscall_attempted(advice.success, advice.message, "madvise(MADV_WILLNEED) failed"),
-                                     advice.success, advice.error_number, advice.message};
-        report_.after_file = measure_residency(mapping_.data(), whole_file, page);
-        if (!advice.success) return done(kExitError, advice.message);
-        if (config_.wait_resident_percent) {
-            report_.notes.push_back(
-                "residency_wait polls mincore() every 10 ms after madvise() and stops when the target "
-                "share of the file is resident, when residency has not grown for plateau_s (e.g. the "
-                "file does not fit under memory.max), or at the timeout; the reason is recorded, not retried.");
-            report_.residency_wait = wait_until_resident(
-                [&] { return measure_residency(mapping_.data(), whole_file, page); },
-                *config_.wait_resident_percent, config_.wait_timeout_s, config_.wait_plateau_s,
-                std::chrono::milliseconds(10));
-            if (!report_.residency_wait->residency.measured) {
-                return done(kExitError, "mincore() failed while waiting for residency: " +
-                                            std::string(std::strerror(report_.residency_wait->residency.error_number)));
-            }
+        report_.notes.push_back(
+            "Prefetch issues madvise(MADV_WILLNEED) per chunk of chunk_bytes (no read() or readahead()). "
+            "With --wait-resident each chunk is polled with mincore() every 10 ms until it reaches the "
+            "target, stops growing for plateau_s, or the overall timeout passes; the loop stops at the "
+            "first chunk that does not reach the target. after_file is measured after the loop.");
+        const auto chunk = config_.prefetch_chunk_bytes;
+        report_.prefetch_chunk_bytes = chunk;
+        const bool wait = config_.wait_resident_percent.has_value();
+        std::string first_error;
+        auto result = prefetch_in_chunks(
+            report_.file_size_bytes, chunk, page,
+            [&](const ByteRange& range) {
+                const auto advice = mapping_.advise_willneed(range.offset, range.length);
+                if (!advice.success && first_error.empty()) first_error = advice.message;
+                return advice.success ? 0 : (advice.error_number != 0 ? advice.error_number : EINVAL);
+            },
+            [&](const ByteRange& range) { return measure_residency(mapping_.data(), {range}, page); },
+            wait ? *config_.wait_resident_percent : 0.0,  // 0: advise every chunk without waiting
+            config_.wait_timeout_s, config_.wait_plateau_s, std::chrono::milliseconds(10));
+        const bool advised_all = result.stopped_reason != "madvise_failed";
+        report_.madvise = CallRecord{
+            0, report_.file_size_bytes, true, advised_all, result.madvise_errno,
+            advised_all ? std::to_string(result.madvise_calls) + " madvise(MADV_WILLNEED) call(s) over " +
+                              std::to_string(chunk) + "-byte chunks returned 0"
+                        : first_error};
+        report_.after_file = result.residency.measured ? result.residency
+                                                       : measure_residency(mapping_.data(), whole_file, page);
+        if (wait) report_.residency_wait = result;
+        if (!advised_all) return done(kExitError, first_error);
+        if (result.stopped_reason == "measurement_failed") {
+            return done(kExitError, "mincore() failed while waiting for residency: " +
+                                        std::string(std::strerror(result.stopped_chunk_residency.error_number)));
         }
         return done(kExitOk, "");
     }
@@ -526,6 +629,7 @@ std::string to_json(const StrategyReport& report) {
                    {"setup_wall_ms", number(report.setup_wall_ms, 3)},
                    {"setup_minor_faults", std::to_string(report.setup_minor_faults)},
                    {"setup_major_faults", std::to_string(report.setup_major_faults)},
+                   {"prefetch_chunk_bytes", optional_number(report.prefetch_chunk_bytes)},
                    {"madvise", report.madvise ? call_json(*report.madvise, 1) : "null"},
                    {"residency_wait", report.residency_wait
                         ? object({{"target_percent", number(report.residency_wait->target_percent, 3)},
@@ -535,7 +639,15 @@ std::string to_json(const StrategyReport& report) {
                                   {"wait_ms", number(report.residency_wait->wait_ms, 3)},
                                   {"polls", std::to_string(report.residency_wait->polls)},
                                   {"timed_out", boolean(report.residency_wait->timed_out)},
-                                  {"residency", residency_json(report.residency_wait->residency, 2)}},
+                                  {"residency", residency_json(report.residency_wait->residency, 2)},
+                                  {"final_percent_file", number(report.residency_wait->residency.percent(), 3)},
+                                  {"bytes_resident_final", std::to_string(report.residency_wait->bytes_resident_final)},
+                                  {"chunk_bytes", std::to_string(report.residency_wait->chunk_bytes)},
+                                  {"chunks_requested", std::to_string(report.residency_wait->chunks_requested)},
+                                  {"chunks_completed", std::to_string(report.residency_wait->chunks_completed)},
+                                  {"madvise_calls", std::to_string(report.residency_wait->madvise_calls)},
+                                  {"chunk_wait_ms", chunk_waits_json(report.residency_wait->chunk_wait_ms, 2)},
+                                  {"stopped_chunk", stopped_chunk_json(*report.residency_wait, 2)}},
                                  1)
                         : "null"},
                    {"selection", selection},

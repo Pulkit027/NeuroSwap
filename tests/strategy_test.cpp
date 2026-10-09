@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 using namespace neuroswap::strategy;
@@ -162,6 +165,116 @@ int main() {
         const auto failed = wait_until_resident([] { Residency r; r.error_number = 12; return r; },
                                                 99.0, 5.0, 3.0, std::chrono::milliseconds(1));
         assert(failed.stopped_reason == "measurement_failed" && failed.polls == 1 && !failed.residency.measured);
+    }
+
+    // chunked prefetch, deterministic: a fake madvise records the advised ranges, a fake
+    // mincore reports per-chunk residency that rises over successive polls.
+    {
+        constexpr std::uint64_t kPage = 4096, kChunk = 4 * kPage, kFile = 14 * kPage;  // chunks of 4,4,4,2 pages
+        struct Fake {
+            std::vector<ByteRange> advised;
+            std::map<std::uint64_t, std::uint64_t> resident;  // chunk offset -> resident pages
+            std::uint64_t stuck_offset = UINT64_MAX;          // this chunk never passes 1 page
+            std::uint64_t step = 2;                           // pages gained per poll
+            int fail_at_call = -1;
+            int advise(const ByteRange& r) {
+                if (static_cast<int>(advised.size()) == fail_at_call) return EINVAL;
+                advised.push_back(r);
+                resident[r.offset] = 0;
+                return 0;
+            }
+            Residency measure(const ByteRange& r) {
+                Residency out;
+                out.measured = true;
+                out.pages_total = (r.length + kPage - 1) / kPage;
+                if (r.offset == 0 && r.length == kFile) {  // final whole-file measurement
+                    for (const auto& [offset, pages] : resident) out.pages_resident += pages;
+                    return out;
+                }
+                auto& pages = resident[r.offset];
+                const auto cap = r.offset == stuck_offset ? 1 : out.pages_total;
+                pages = std::min<std::uint64_t>(pages + step, cap);
+                out.pages_resident = pages;
+                return out;
+            }
+        };
+        auto run = [&](Fake& fake, double timeout_s, double plateau_s) {
+            return prefetch_in_chunks(
+                kFile, kChunk, kPage, [&](const ByteRange& r) { return fake.advise(r); },
+                [&](const ByteRange& r) { return fake.measure(r); }, 99.0, timeout_s, plateau_s,
+                std::chrono::milliseconds(1));
+        };
+
+        // progression: every chunk reaches the target; ranges cover the file in order.
+        Fake all;
+        const auto done = run(all, 5.0, 3.0);
+        assert(done.stopped_reason == "target" && !done.timed_out && !done.stopped_chunk_index);
+        assert(done.chunks_requested == 4 && done.chunks_completed == 4 && done.madvise_calls == 4);
+        assert(all.advised.size() == 4 && all.advised[3].offset == 12 * kPage && all.advised[3].length == 2 * kPage);
+        assert(done.chunk_wait_ms.size() == 4);
+        assert(done.residency.pages_total == 14 && done.residency.pages_resident == 14);
+        assert(done.bytes_resident_final == kFile);
+
+        // plateau mid-file: chunk 2 sticks at 1 of 4 pages; chunk 3 is never advised.
+        Fake mid;
+        mid.stuck_offset = 2 * kChunk;
+        const auto plateau = run(mid, 5.0, 0.05);
+        assert(plateau.stopped_reason == "plateau" && plateau.stopped_chunk_index == 2u);
+        assert(plateau.chunks_completed == 2 && plateau.madvise_calls == 3 && mid.advised.size() == 3);
+        assert(plateau.stopped_chunk.offset == 2 * kChunk && plateau.stopped_chunk_residency.pages_resident == 1);
+        assert(plateau.stopped_chunk_wait_ms >= 50.0 && plateau.chunk_wait_ms.size() == 2);
+        assert(plateau.residency.pages_resident == 9 && plateau.bytes_resident_final == 9 * kPage);
+
+        // timeout: residency grows one page per poll, too slowly for a 50 ms overall limit.
+        Fake slow;
+        slow.step = 1;
+        const auto timeout = prefetch_in_chunks(
+            kFile, kChunk, kPage, [&](const ByteRange& r) { return slow.advise(r); },
+            [&](const ByteRange& r) { auto out = slow.measure(r); return out; }, 99.0, 0.05, 3.0,
+            std::chrono::milliseconds(20));
+        assert(timeout.stopped_reason == "timeout" && timeout.timed_out && timeout.stopped_chunk_index);
+        assert(timeout.chunks_completed < timeout.chunks_requested && timeout.wait_ms >= 50.0);
+
+        // madvise failure on the 2nd chunk.
+        Fake failing;
+        failing.fail_at_call = 1;
+        const auto failed = run(failing, 5.0, 3.0);
+        assert(failed.stopped_reason == "madvise_failed" && failed.madvise_errno == EINVAL);
+        assert(failed.stopped_chunk_index == 1u && failed.chunks_completed == 1);
+    }
+
+    // default chunk size is 8 MiB and is recorded for prefetch only.
+    {
+        assert(StrategyConfig{}.prefetch_chunk_bytes == 8 * kMiB);
+        StrategySession prefetch(config_for(path, Strategy::Prefetch));
+        assert(prefetch.run() == kExitOk);
+        assert(prefetch.report().prefetch_chunk_bytes == 8 * kMiB);
+        assert(to_json(prefetch.report()).find("\"prefetch_chunk_bytes\": 8388608") != std::string::npos);
+        StrategySession baseline(config_for(path, Strategy::Baseline));
+        assert(baseline.run() == kExitOk && !baseline.report().prefetch_chunk_bytes);
+        assert(to_json(baseline.report()).find("\"prefetch_chunk_bytes\": null") != std::string::npos);
+    }
+
+    // chunked prefetch through the session on the temp file: 1-page chunks, 7 chunks.
+    {
+        auto config = config_for(path, Strategy::Prefetch);
+        config.prefetch_chunk_bytes = page;
+        config.wait_resident_percent = 99.0;
+        config.wait_timeout_s = 5.0;
+        StrategySession session(config);
+        assert(session.run() == kExitOk);
+        const auto& report = session.report();
+        assert(report.madvise && report.madvise->success);
+        const auto& wait = report.residency_wait;
+        assert(wait && wait->chunk_bytes == page && wait->chunks_requested == 7);
+        assert(wait->madvise_calls >= 1 && wait->madvise_calls <= 7);
+        if (wait->stopped_reason == "target") assert(wait->chunks_completed == 7);
+        else assert(wait->stopped_chunk_index && wait->chunks_completed < 7);
+        assert(wait->residency.pages_total == 7);
+        const auto json = to_json(report);
+        assert(json.find("\"chunks_completed\": ") != std::string::npos);
+        assert(json.find("\"final_percent_file\": ") != std::string::npos);
+        assert(json.find("\"chunk_wait_ms\": ") != std::string::npos);
     }
 
     // residency wait on the real temp file through the prefetch session.

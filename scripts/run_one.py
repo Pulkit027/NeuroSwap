@@ -53,8 +53,9 @@ CGROUP = Path("/sys/fs/cgroup/neuroswap_run")
 SHA_CACHE = REPO / "results/raw/llm/.model_sha256.json"
 STRATEGIES = ["baseline", "prefetch", "pin"]
 HELPER_BIN = REPO / "build/neuroswap_strategy"
-PREFETCH_WAIT_RESIDENT = "99"
-PREFETCH_WAIT_TIMEOUT_S = "120"
+PREFETCH_CHUNK_MIB = "8"        # madvise(WILLNEED) per chunk; 32 MiB plateaued at 8 MiB
+PREFETCH_WAIT_RESIDENT = "99"   # per-chunk target
+PREFETCH_WAIT_TIMEOUT_S = "120"  # whole chunk loop
 PREFETCH_WAIT_PLATEAU_S = "3"
 HELPER_READY_TIMEOUT_S = 300   # helper setup incl. the prefetch residency wait
 HELPER_RELEASE_TIMEOUT_S = 30
@@ -295,8 +296,8 @@ def start_helper(args, tmp, use_cgroup, record):
     if use_cgroup:
         cmd += ["--cgroup", str(CGROUP)]
     if args.strategy == "prefetch":
-        cmd += ["--wait-resident", PREFETCH_WAIT_RESIDENT, "--wait-timeout", PREFETCH_WAIT_TIMEOUT_S,
-                "--wait-plateau-s", PREFETCH_WAIT_PLATEAU_S]
+        cmd += ["--prefetch-chunk-mib", PREFETCH_CHUNK_MIB, "--wait-resident", PREFETCH_WAIT_RESIDENT,
+                "--wait-timeout", PREFETCH_WAIT_TIMEOUT_S, "--wait-plateau-s", PREFETCH_WAIT_PLATEAU_S]
     if args.strategy == "pin":
         cmd += ["--fraction", repr(args.pin_fraction)]
     t0 = time.monotonic()
@@ -516,6 +517,7 @@ def main():
         "helper_report": None,         # neuroswap_strategy's JSON report, unmodified
         "inference_wall_s": None,      # llama-completion only (same as wall_s)
         "total_wall_s": None,          # strategy setup + inference
+        "prefetch_chunk_mib": int(PREFETCH_CHUNK_MIB) if args.strategy == "prefetch" else None,
     }
     try:
         run(args, prompt_text, record)
