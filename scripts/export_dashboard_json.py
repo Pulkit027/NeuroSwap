@@ -158,7 +158,8 @@ def main():
     for path in written:
         payload = json.loads(path.read_text())
         size = len(payload["data"]) if isinstance(payload["data"], list) else len(payload["data"].get("rows", payload["data"]))
-        print(f"wrote {path.relative_to(repo)}  kind={payload['kind']}  entries={size}")
+        shown = path.relative_to(repo) if path.is_relative_to(repo) else path
+        print(f"wrote {shown}  kind={payload['kind']}  entries={size}")
     return 0
 
 
