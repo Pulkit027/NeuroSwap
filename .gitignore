@@ -9,3 +9,10 @@ data/prompts.jsonl
 
 # Phase 2 LLM run telemetry (not committed yet)
 results/raw/llm/
+
+# Phase 5 generated outputs (rebuilt from results/raw/llm by the scripts)
+results/processed/train.csv
+results/processed/test.csv
+results/ml/
+results/policies/
+results/dashboard/
