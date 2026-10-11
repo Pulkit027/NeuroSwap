@@ -1,0 +1,21 @@
+{
+  "source": "neuroswap_measured",
+  "kind": "model_output",
+  "generated_at": "2026-10-10T11:45:34+00:00",
+  "inputs": [
+    "results/ml/feature_importance.json"
+  ],
+  "data": {
+    "source": "neuroswap_measured",
+    "model": "random_forest",
+    "method": "impurity-based, train fit",
+    "importances": {
+      "prompt_tokens": 0.7136898334678669,
+      "memory_limit_mb": 0.2573659885247421,
+      "strategy_baseline": 0.004815560732100519,
+      "strategy_pin": 0.004030776183607132,
+      "strategy_prefetch": 0.0,
+      "pin_fraction": 0.020097841091683506
+    }
+  }
+}

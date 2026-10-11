@@ -1,0 +1,115 @@
+{
+  "source": "neuroswap_measured",
+  "kind": "derived_from_measured",
+  "generated_at": "2026-10-10T11:45:34+00:00",
+  "inputs": [
+    "results/raw/llm/pilot.jsonl",
+    "results/raw/llm/pilot_tight.jsonl",
+    "results/raw/llm/final.jsonl",
+    "results/ml/metrics.json",
+    "results/policies/policy_results.json"
+  ],
+  "data": {
+    "plans": {
+      "pilot": {
+        "runs": 288,
+        "errors": 0,
+        "prompts": 12,
+        "memory_limits": [
+          "1100M",
+          "none"
+        ],
+        "conditions": [
+          "baseline",
+          "pin0.25",
+          "pin0.5",
+          "prefetch"
+        ],
+        "cold": [
+          false,
+          true
+        ],
+        "session_started_at": "2026-10-08T15:04:18+00:00",
+        "session_updated_at": "2026-10-08T19:49:36+00:00",
+        "llama_cpp_commit": [
+          "43fe9c64281ef735046adc025e9e7559a1f659a5"
+        ],
+        "model_sha256": [
+          "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+        ],
+        "repack": [
+          "off"
+        ]
+      },
+      "pilot_tight": {
+        "runs": 48,
+        "errors": 0,
+        "prompts": 4,
+        "memory_limits": [
+          "1000M"
+        ],
+        "conditions": [
+          "baseline",
+          "pin0.25",
+          "pin0.5",
+          "prefetch"
+        ],
+        "cold": [
+          true
+        ],
+        "session_started_at": "2026-10-08T14:06:41+00:00",
+        "session_updated_at": "2026-10-08T14:58:45+00:00",
+        "llama_cpp_commit": [
+          "43fe9c64281ef735046adc025e9e7559a1f659a5"
+        ],
+        "model_sha256": [
+          "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+        ],
+        "repack": [
+          "off"
+        ]
+      },
+      "final": {
+        "runs": 144,
+        "errors": 0,
+        "prompts": 12,
+        "memory_limits": [
+          "1100M",
+          "none"
+        ],
+        "conditions": [
+          "baseline",
+          "pin0.25",
+          "prefetch"
+        ],
+        "cold": [
+          true
+        ],
+        "session_started_at": "2026-10-09T08:57:08+00:00",
+        "session_updated_at": "2026-10-09T10:01:01+00:00",
+        "llama_cpp_commit": [
+          "43fe9c64281ef735046adc025e9e7559a1f659a5"
+        ],
+        "model_sha256": [
+          "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+        ],
+        "repack": [
+          "off"
+        ]
+      }
+    },
+    "ml": {
+      "train_rows": 216,
+      "test_rows": 144,
+      "selected_model": "median_bucket_limit",
+      "selection": "lowest leave-one-prompt-out CV MAE on train"
+    },
+    "policy_statement": "Policies with a lower mean measured total_wall_s than always-baseline (25.502 s) on the test set: rule (tokens > 1383) (25.121 s), ml (random forest) (24.842 s).",
+    "notes": [
+      "pilot 'none' runs were warm; final runs, 'none' included, were cold",
+      "pilot prefetch: one whole-file madvise, ~0.75% resident; not a test of prefetch",
+      "final prefetch used 8 MiB madvise chunks",
+      "pilot data may be used for training; final prompts are the held-out test set"
+    ]
+  }
+}

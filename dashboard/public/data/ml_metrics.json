@@ -1,0 +1,138 @@
+{
+  "source": "neuroswap_measured",
+  "kind": "derived_from_measured",
+  "generated_at": "2026-10-10T11:45:34+00:00",
+  "inputs": [
+    "results/ml/metrics.json"
+  ],
+  "data": {
+    "source": "neuroswap_measured",
+    "target": "total_wall_s",
+    "selected_model": "median_bucket_limit",
+    "selection": "lowest leave-one-prompt-out CV MAE on train",
+    "train_rows": 216,
+    "test_rows": 144,
+    "cv_train": {
+      "median_bucket_limit": {
+        "n": 216,
+        "mae": 4.821886574074075,
+        "rmse": 7.899870769644484,
+        "r2": 0.8458125886862871
+      },
+      "linear_tokens_per_limit": {
+        "n": 216,
+        "mae": 5.264707041993602,
+        "rmse": 8.470375725426944,
+        "r2": 0.8227385517566416
+      },
+      "random_forest": {
+        "n": 216,
+        "mae": 6.007066710641469,
+        "rmse": 9.830047747275326,
+        "r2": 0.7612627440133104
+      }
+    },
+    "test": {
+      "median_bucket_limit": {
+        "all test rows": {
+          "n": 144,
+          "mae": 6.406090277777777,
+          "rmse": 9.643124966423258,
+          "r2": 0.802216358917056
+        },
+        "baseline + pin rows": {
+          "n": 96,
+          "mae": 5.875791666666667,
+          "rmse": 10.03406844829155,
+          "r2": 0.7910838245185722
+        },
+        "prefetch rows (unseen strategy)": {
+          "n": 48,
+          "mae": 7.4666875,
+          "rmse": 8.80934266016294,
+          "r2": 0.8252044892447654
+        },
+        "baseline + pin rows, limit 1100M": {
+          "n": 48,
+          "mae": 7.402083333333333,
+          "rmse": 12.910776990561024,
+          "r2": 0.7672926912780282
+        },
+        "baseline + pin rows, limit none": {
+          "n": 48,
+          "mae": 4.3495,
+          "rmse": 5.888709260101063,
+          "r2": 0.7326286071789943
+        }
+      },
+      "linear_tokens_per_limit": {
+        "all test rows": {
+          "n": 144,
+          "mae": 5.473646523029705,
+          "rmse": 8.958435167248032,
+          "r2": 0.8293056728450028
+        },
+        "baseline + pin rows": {
+          "n": 96,
+          "mae": 5.322697676937754,
+          "rmse": 9.411716780092057,
+          "r2": 0.8161957082033565
+        },
+        "prefetch rows (unseen strategy)": {
+          "n": 48,
+          "mae": 5.775544215213611,
+          "rmse": 7.9749518142761255,
+          "r2": 0.8567484257105764
+        },
+        "baseline + pin rows, limit 1100M": {
+          "n": 48,
+          "mae": 7.345966403612102,
+          "rmse": 12.44438568467389,
+          "r2": 0.7838017423750095
+        },
+        "baseline + pin rows, limit none": {
+          "n": 48,
+          "mae": 3.2994289502634047,
+          "rmse": 4.722085389784505,
+          "r2": 0.8280736728526783
+        }
+      },
+      "random_forest": {
+        "all test rows": {
+          "n": 144,
+          "mae": 5.124205905142698,
+          "rmse": 7.528108594185598,
+          "r2": 0.8794612930241652
+        },
+        "baseline + pin rows": {
+          "n": 96,
+          "mae": 4.692541807274131,
+          "rmse": 7.6421402759849375,
+          "r2": 0.8788152535336611
+        },
+        "prefetch rows (unseen strategy)": {
+          "n": 48,
+          "mae": 5.98753410087983,
+          "rmse": 7.294699515531187,
+          "r2": 0.8801444684757733
+        },
+        "baseline + pin rows, limit 1100M": {
+          "n": 48,
+          "mae": 5.8196394565596465,
+          "rmse": 9.583601401452196,
+          "r2": 0.8717779402339467
+        },
+        "baseline + pin rows, limit none": {
+          "n": 48,
+          "mae": 3.5654441579886167,
+          "rmse": 4.995918351389037,
+          "r2": 0.8075555560157589
+        }
+      }
+    },
+    "notes": [
+      "prefetch rows in test are an unseen strategy (no prefetch in train)",
+      "train 'none' rows were warm, test rows are all cold"
+    ]
+  }
+}
